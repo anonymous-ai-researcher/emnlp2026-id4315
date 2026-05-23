@@ -1,0 +1,10 @@
+numpy>=1.24
+matplotlib>=3.7
+torch>=2.1
+transformers>=4.36
+transformer_lens>=2.0
+tracr>=1.1
+pandas>=2.0
+scipy>=1.11
+seaborn>=0.13
+tqdm>=4.65

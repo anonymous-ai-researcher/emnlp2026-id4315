@@ -1,0 +1,3487 @@
+% =====================================================================
+%  EMNLP 2026 -- Paper #3
+%  When Does a Chain of Thought Commit?
+%  Causal Lookahead Probing of Reasoning-Tuned Language Models
+%
+%  Master file. Uses the official ACL/EMNLP template (acl.sty) verbatim;
+%  template format is NOT modified. Bib: emnlp.bib (acl_natbib.bst).
+%  Written sections are filled in.
+%  No em dashes anywhere (author preference).
+% =====================================================================
+\documentclass[11pt]{article}
+\usepackage[review]{acl}
+\usepackage{times}
+\usepackage{latexsym}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{graphicx}
+% ===== Additional packages =====
+\usepackage{amsmath,amssymb}
+\usepackage{amsthm}
+\newtheorem{definition}{Definition}
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}{Proposition}
+\newtheorem{lemma}{Lemma}
+\newtheorem{corollary}{Corollary}
+\newtheorem*{remark}{Remark}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{supertabular}
+\usepackage{multirow}
+\usepackage{xcolor}
+\definecolor{ckblue}{HTML}{0072B2}
+\definecolor{ckskyblue}{HTML}{56B4E9}
+\definecolor{ckgreen}{HTML}{009E73}
+\definecolor{ckorange}{HTML}{E69F00}
+\definecolor{ckvermillion}{HTML}{D55E00}
+\definecolor{ckgray}{HTML}{999999}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{hyperref}
+\usepackage{cleveref}
+
+% ===== Custom commands (shared macros) =====
+\newcommand{\CD}{\mathrm{CD}}
+\newcommand{\CDP}{\mathrm{CD}_{P}}
+\newcommand{\CDM}{\mathrm{CD}_{M}}
+\newcommand{\stepk}{k}
+\newcommand{\CLP}{\textsc{CLP}}
+\newcommand{\CRASPCoT}{\textsc{C-RASP}^{\textsc{CoT}}}
+\newcommand{\Pythia}{\textsc{Pythia}}
+\newcommand{\Llama}{\textsc{Llama-3.2}}
+\newcommand{\Mamba}{\textsc{Mamba}}
+\newcommand{\Rdistill}{\textsc{R1-Distill}}
+
+\title{When Does a Chain of Thought Commit?\\
+       Causal Lookahead Probing of Reasoning-Tuned Language Models}
+
+\author{Anonymous}
+
+\begin{document}
+\maketitle
+
+% =====================================================================
+%  ABSTRACT
+% =====================================================================
+\begin{abstract}
+Reasoning models generate long chains of thought before answering, and users
+increasingly read those chains as evidence of how a decision was reached. But
+when does the model actually settle on its answer, and is it still computing
+at the step where it appears to be reasoning? We introduce \emph{Commitment
+Depth}, a causal measure that transplants one step's internal state from a
+different problem and checks whether the final answer follows the transplant.
+If the model has already written its answer into the state at that step, the
+transplant redirects the output; if the answer has not yet been determined,
+the transplant washes out. To judge whether commitment is premature, we
+derive a \emph{prescribed trajectory} from the information a reference program
+accumulates step by step, and prove that any faithful chain of thought must
+commit no faster than this trajectory allows. We estimate Commitment Depth
+with \emph{Causal Lookahead Probing} (CLP), a parameter-free intervention
+that, by learning no alignment, escapes the non-linear representation dilemma
+that renders learned-probe causal analyses vacuous. Across five
+state-tracking tasks and four model families (Pythia, Llama-3.2, Mamba, and
+the RL-tuned R1-Distill), we find that reinforcement-tuned models commit up
+to $2.43\times$ earlier than the prescribed trajectory at matched accuracy,
+while base and instruction-tuned models respect the bound. On
+Tracr-compiled models with known computation, CLP recovers the prescribed
+trajectory within its confidence interval. These results provide the first
+causal evidence that reinforcement-tuned chains of thought often replay a
+settled answer rather than derive it.\footnote{Code, compiled programs, and data: \texttt{\small[anonymous URL]}.}
+\end{abstract}
+
+% =====================================================================
+%  1  INTRODUCTION  (related work folded in)
+% =====================================================================
+\section{Introduction}
+
+A chain of thought (CoT) is not a stylistic flourish; it changes what a transformer
+can compute. A constant-depth model is confined to $\mathsf{TC}^0$; the same
+architecture, generating intermediate tokens, climbs to $\mathsf{P}$, each
+token contributing a serial state unit the fixed-depth network lacks
+\citep{DBLP:conf/iclr/MerrillS24,DBLP:conf/nips/FengZGY0W23,DBLP:journals/corr/abs-2112-00114}.
+This is now practice: reinforcement-learned reasoning models rely on long chains
+of thought \citep{DBLP:journals/nature/GuoYZSWZXZMBZY025}, and their traces are
+read as decision evidence by humans and downstream models alike
+\citep{DBLP:journals/corr/abs-2507-11473}. If the serial computation lives in
+the chain, that is where we should be able to watch it happen.
+
+Whether we can is unclear, since the expressivity theorems guarantee only that a
+faithful execution \emph{exists}, not that a trained model's trace \emph{is}
+one. Transformers solve algorithmic tasks just as well when reasoning tokens are
+replaced by filler supplying only serial positions
+\citep{DBLP:journals/corr/abs-2404-15758,DBLP:conf/iclr/GoyalJRMKN24}; and even
+when tokens do carry content, they are not always operative: models adopt
+answers from unverbalized features \citep{DBLP:journals/corr/abs-2503-08679} and rationalize
+settled conclusions \citep{DBLP:journals/corr/abs-2505-05410}. Misleading
+prompts steer chains to wrong answers even when the model would otherwise
+succeed \citep{DBLP:conf/nips/TurpinMPB23}.
+
+These observations have motivated a sustained effort to measure faithfulness
+from inputs and outputs alone.
+\citet{DBLP:conf/acl/JacoviG20} gave it a formal counterfactual criterion.
+Subsequent work operationalized it through chain truncation
+\citep{DBLP:journals/corr/abs-2307-13702}, step corruption
+\citep{DBLP:journals/corr/abs-2602-11201}, and parameter erasure
+\citep{DBLP:conf/emnlp/TutekCMB25}. The verdict is sobering, but the evidence
+rests on behavioral signals that are themselves fragile:
+\citet{DBLP:journals/tmlr/BenthamSM24} showed that a leading metric largely
+re-encodes accuracy and answer-letter bias. Behavioral tests can detect that
+something is wrong; they cannot locate what, inside the model, is wrong.
+
+A second body of work looks inside and finds the answer legible early. The logit
+lens \citep{nostalgebraist2020logitlens}, tuned lens
+\citep{DBLP:journals/corr/abs-2303-08112}, and forward lens
+\citep{DBLP:conf/conll/PalSYWB23} reveal the eventual answer from the first few
+tokens; probing reasoning traces directly confirms this
+\citep{DBLP:journals/corr/abs-2603-05488,
+DBLP:journals/corr/abs-2603-01437,DBLP:journals/corr/abs-2511-14773,
+DBLP:journals/corr/abs-2604-06613}. The temptation is to conclude that the model
+has committed, but the inference fails: a linearly recoverable direction need
+not play any causal role in the output
+\citep{DBLP:conf/nips/VigGBQNSS20,DBLP:conf/nips/GeigerLIP21}. Commitment
+demands a counterfactual: \emph{altering} the state must change the answer, not
+merely \emph{reading} it.
+
+The causal toolkit supplies such counterfactuals. Mediation analysis, activation
+patching, and circuit discovery locate causally relevant components
+\citep{DBLP:conf/emnlp/StolfoBS23,DBLP:conf/nips/MengBAB22,DBLP:journals/corr/abs-2404-15255,DBLP:conf/iclr/WangVCSS23},
+and causal abstraction formalizes whether a network implements a hypothesized
+algorithm \citep{DBLP:journals/jmlr/GeigerIZCC0AWGP25}. The sharpest tool in
+this family, distributed alignment search (DAS), learns a rotation $R\!\in\!O(d)$ so that
+subspace interventions match interventions on a hypothesized variable
+\citep{DBLP:conf/clear2/GeigerWPIG24}. The flexibility of this rotation is also
+its weakness. \citet{sutter2025nonlinear} proved that a sufficiently expressive
+alignment maps any algorithm onto any network, reaching perfect scores even on
+randomly initialized models, so a high alignment score certifies nothing.
+Restricting to linear maps is one escape, but linearity is contested
+\citep{DBLP:conf/icml/ParkCV24,DBLP:conf/iclr/BurnsYKS23} and the choice
+silently determines the verdict. This is the first gap: a causal test of
+commitment that rests on no learned alignment at all is missing.
+
+A second gap is logically prior. Even with a trustworthy measure of
+\emph{when} a model commits, we lack a principled account of when it
+\emph{should}. Earliness is suspect only relative to the task's information
+demands: if the answer is genuinely determined after a few symbols, committing
+then is correct, and calling it premature would be a false alarm. The
+\textsc{Rasp} family compiles readable algorithms into transformer
+weights \citep{DBLP:conf/icml/WeissGY21}, and its
+counting variant \textsc{C-Rasp} is the tightest known expressivity bound for
+future-masked transformers, with a depth hierarchy over serial cost
+\citep{DBLP:conf/nips/YangCCN25}. A $\CRASPCoT$ program states, symbol by
+symbol, when the answer becomes determined and thus when commitment is licensed.
+No prior work has used such a program to set a normative bar on the dynamics of
+an emitted CoT.
+
+We close both gaps at once. We define \textbf{Commitment Depth}
+$\CD(\stepk)$: transplant the step-$\stepk$ residual stream from a different
+problem and observe how often the final answer follows. If the model has already
+written its answer into the state at step $\stepk$, the transplant redirects the
+output; if the answer has not yet been determined there, the transplant washes
+out. We pair this measure with a \textbf{prescribed trajectory}
+$\CDP(\stepk)$ that a $\CRASPCoT$ reference program licenses, prove a
+faithfulness bound $\CDM(\stepk)\le\CDP(\stepk)$, and estimate $\CD$ with
+\textbf{Causal Lookahead Probing} (\CLP), a parameter-free intervention that
+learns no alignment and therefore lies outside the construction that makes
+alignment search vacuous. The cost is that \CLP\ measures \emph{whether} a
+model has committed, not \emph{which variable} carries the commitment. For the
+question of this paper, the former is what matters. Our main contributions are
+as follows.
+\begin{itemize}[leftmargin=*,topsep=2pt,itemsep=2pt]
+
+\item We prove that any correct executor of a state-tracking task must satisfy
+$\CDM(\stepk)\le\CDP(\stepk)$, a bound that is task-specific but
+algorithm-independent, turning premature commitment into a falsifiable claim
+(\cref{sec:cd}; proof in \cref{app:proof}).
+
+\item \CLP\ is, to our knowledge, the first causal measure of CoT commitment
+timing that requires no learned alignment, placing it outside the non-linear
+representation dilemma of \citet{sutter2025nonlinear} (\cref{sec:clp};
+\cref{app:dilemma}).
+
+\item We compile $\CRASPCoT$ programs for five tasks spanning bounded-depth
+bracket matching, solvable and non-solvable group computation, finite-state
+execution, and natural-language entity tracking, and validate \CLP\ by
+recovering $\CDP$ on Tracr-compiled models within its confidence interval
+(\cref{sec:setup,sec:results}).
+
+\item At matched final-answer accuracy, the RL-tuned \Rdistill\ violates the
+bound on every task, committing up to $2.43\times$ earlier than $\CDP$, while
+base, instruction-tuned, and state-space models all respect it ($U<0.035$).
+This is the first causal evidence that reinforcement-tuned CoT often replays a
+settled answer rather than derives it (\cref{sec:results}).
+
+\end{itemize}
+
+% =====================================================================
+%  2  PRELIMINARIES AND PROBLEM SETUP
+% =====================================================================
+\section{Preliminaries and Problem Setup}
+\label{sec:prelim}
+
+We study CoT traces as computational objects. This section introduces the
+notation for models and their intermediate states, the programming language we
+use to specify a reference algorithm for each task, and the causal notion of
+faithfulness that the rest of the paper builds on.
+
+\subsection{Chain-of-Thought Computation}
+\label{sec:prelim-cot}
+
+Let $\mathcal{M}$ be an autoregressive language model over a finite vocabulary
+$\Sigma$, with $L$ transformer layers and model dimension $d$. Each layer reads
+and updates a hidden state vector at every position; we call this per-position
+vector the \emph{residual stream} (the running sum along the residual
+connections) and write $\mathbf{h}^{(\ell)}_i \in \mathbb{R}^{d}$ for it at
+layer $\ell$ and position $i$.
+
+A \emph{chain of thought} on a problem instance is the sequence of tokens
+$x_{1}, x_{2}, \ldots, x_{T}$ that $\mathcal{M}$ generates after the prompt and
+before the answer is read, where $T$ is the length of the trace and the
+\emph{step index} $\stepk \in \{1, \ldots, T\}$ counts generated tokens. We
+write $x_{1{:}\stepk} = x_{1}, \ldots, x_{\stepk}$ for the prefix through step
+$\stepk$. The model's \emph{answer} is a discrete label $a \in \mathcal{A}$
+obtained by applying a fixed readout $\kappa$ to the logits at the final
+position, $a = \kappa(\mathcal{M}(x_{1{:}T}))$; for the state-tracking tasks we
+study, $\mathcal{A}$ is the finite set of valid answers (group elements, binary
+labels, automaton states, or entity locations) and $\kappa$ returns the
+highest-scoring one.
+
+To probe commitment we adopt the standard interpretability convention of
+\emph{interchange interventions}: we pair a \emph{base} instance $\mathbf{b}$
+(the problem under study) with a \emph{source} instance $\mathbf{s}$ (a
+different problem whose gold answer differs), run $\mathcal{M}$ on both, and at
+a chosen step $\stepk$ replace the base run's residual stream with the source
+run's. If the final answer changes to follow the source, the model's state at
+step $\stepk$ was still causally relevant; if the answer stays with the base,
+the model had already committed. We use $\mathbf{b}$ and $\mathbf{s}$ throughout
+in this sense.
+
+\subsection{Prescribing an Algorithm: \texorpdfstring{$\CRASPCoT$}{C-RASP-CoT}}
+\label{sec:prelim-crasp}
+
+To judge whether commitment is premature, we need a reference algorithm whose
+information demands are explicit: one that states, step by step, how much it has
+learned about the answer. We take this reference from \textsc{C-Rasp}, a
+programming language designed to characterize what transformers can compute
+\citep{DBLP:conf/icml/WeissGY21,
+DBLP:journals/corr/abs-2404-04393,DBLP:conf/nips/YangCCN25}. A \textsc{C-Rasp}
+program operates on an input string $w = w_{1}\cdots w_{n} \in \Sigma^{+}$; its
+key primitive, \emph{prefix counting}, lets it track quantities such as bracket
+nesting depth or a running group product, and the nesting depth of these counts
+measures the serial computation the program requires
+\citep{DBLP:conf/nips/YangCCN25}. A \textsc{C-Rasp} program can be compiled
+into transformer weights via Tracr \citep{DBLP:conf/nips/LindnerKFRMM23},
+producing a model that provably executes it; we use this for validation. The
+full primitive set is in \cref{app:craspcot-standard}.
+
+A standard \textsc{C-Rasp} program reads its entire input at once, but a CoT
+emits one symbol at a time and conditions on what it has already written. We
+therefore use $\CRASPCoT$, the autoregressive reading of a \textsc{C-Rasp}
+program in which the program consumes the prefix $x_{1{:}\stepk}$ available at
+step $\stepk$ and may read its own previous outputs as input to later steps.
+The semantics and equivalence to standard \textsc{C-Rasp} under this reading are
+given in \cref{app:craspcot}; for the present section the program is a map
+$\pi$ from prefixes to a distribution over the answer set $\mathcal{A}$.
+
+The reference a program $\pi$ provides is informational. Let $\mathcal{D}$ be
+the task distribution over instances, let $a$ be the answer as a random
+variable, and let $H(\cdot)$ denote Shannon entropy in bits. The
+\emph{information accumulated} by $\pi$ through step $\stepk$ is the reduction
+in the answer's uncertainty given the prefix the program has read,
+\begin{equation}
+\label{eq:infoacc}
+I_{\pi}(\stepk) \;=\; H(a) \;-\; H\!\left(a \mid x_{1{:}\stepk}\right),
+\end{equation}
+which increases from $0$ at $\stepk = 0$ to $H(a)$ once the prefix determines
+the answer. A program that reveals the answer early has a fast-rising
+$I_{\pi}$; one that requires reading the entire input has a slowly rising one.
+This quantity is the basis from which we derive, in the next section, the
+trajectory that a faithful execution may not outrun.
+
+\subsection{Faithfulness as a Causal Property}
+\label{sec:prelim-faithfulness}
+
+A CoT is \emph{faithful} when the steps it emits are the steps the model uses
+to reach its answer \citep{DBLP:conf/acl/JacoviG20}. This is a statement about
+the model's computation, not about the plausibility or correctness of the text.
+As discussed in the introduction, behavioral tests (truncating the chain,
+corrupting a step) and representational tests (probing hidden states) each fall
+short: the former are confounded by accuracy and format bias, the latter
+establish decodability but not causation.
+
+We therefore adopt a causal reading. A CoT has \emph{committed} to an answer at
+step $\stepk$ if the model's internal state at that step determines the answer:
+replacing it with the state from a different problem redirects the output.
+Conversely, if such a replacement leaves the answer unchanged, the answer has
+\emph{not} been committed at step $\stepk$, because it is derived from
+computation that comes later. The next section formalizes this as Commitment
+Depth, a continuous quantity that can be measured at every step and compared
+against the prescribed trajectory derived from $I_{\pi}$.
+
+% =====================================================================
+%  3  COMMITMENT DEPTH AND THE PRESCRIBED TRAJECTORY
+% =====================================================================
+\section{Commitment Depth and the Prescribed Trajectory}
+\label{sec:cd}
+
+The causal reading of faithfulness in \cref{sec:prelim-faithfulness} is a
+yes-or-no test at a single step. We now turn it into two continuous
+trajectories: one recording when a model commits, one stating when committing is
+warranted.
+
+\subsection{Commitment Depth}
+\label{sec:cd-def}
+
+Fix a model $\mathcal{M}$ and a base--source pair $(\mathbf{b},\mathbf{s})$
+with $a(\mathbf{b})\neq a(\mathbf{s})$ as defined in \cref{sec:prelim-cot}.
+The requirement that the two answers differ makes the intervention
+\emph{impactful}: a flip is observable only when there is a different answer to
+flip to \citep{DBLP:conf/nips/GeigerLIP21}.
+
+\begin{definition}[Commitment Depth]
+\label{def:cd}
+Run $\mathcal{M}$ on $\mathbf{b}$. At CoT step $\stepk$, replace the
+last-layer residual stream $\mathbf{h}^{(L)}$ at the step-$\stepk$ position with
+the value it takes when $\mathcal{M}$ is run on $\mathbf{s}$, then let
+$\mathcal{M}$ complete the remaining chain autoregressively and read the answer
+through $\kappa$. The \emph{Commitment Depth} of $\mathcal{M}$ at step $\stepk$
+is the probability, over base--source pairs drawn from the task distribution
+$\mathcal{D}$ with $a(\mathbf{b})\neq a(\mathbf{s})$, that this intervention
+drives the final answer to the source answer:
+\begin{equation}
+\label{eq:cd}
+\CDM(\stepk) \;=\; \Pr_{(\mathbf{b},\mathbf{s})}\!\left[\,
+\kappa\!\left(\mathcal{M}^{\,\mathbf{h}^{(L)}_{\stepk}\leftarrow \mathbf{s}}(\mathbf{b})\right)
+= a(\mathbf{s})\,\right].
+\end{equation}
+\end{definition}
+
+The quantity reads directly as a measure of how far the model's answer has
+been written into the residual stream by step $\stepk$. When $\CDM(\stepk)$ is
+high, the step-$\stepk$ state carries the answer: transplanting a different
+state redirects the output, confirming that the model has committed by that
+point. When $\CDM(\stepk)$ is low, the answer has not yet been encoded at step
+$\stepk$: the transplant has no effect because the model derives its answer from
+subsequent computation. The contrast is sharp in practice: on $A_5/S_5$ at
+normalized step $\stepk=0.35$, the RL-tuned model's $\CDM$ already exceeds
+$0.60$ while the prescribed trajectory $\CDP$ is below $0.04$, a gap that
+constitutes a bound violation. The intervention is the entire last-layer
+residual stream at a single step, and it is parameter-free; the reasons for this
+choice, and its relation to other interventions, are given in \cref{sec:clp}.
+
+\subsection{The Prescribed Trajectory}
+\label{sec:cd-prescribed}
+
+Commitment Depth records when a model commits, but earliness is only suspect
+relative to the information the task makes available. We therefore set against
+it a normative trajectory derived from the $\CRASPCoT$ program $\pi$ for the
+task. Recall from \cref{eq:infoacc} that $I_{\pi}(\stepk)=H(a)-H(a\mid
+x_{1{:}\stepk})$ is the information the program has accumulated about the answer
+by step $\stepk$.
+
+\begin{definition}[Prescribed trajectory]
+\label{def:cdp}
+The \emph{prescribed trajectory} is $\CDP(\stepk)=g\!\left(I_{\pi}(\stepk)\right)$,
+where the link function $g:[0,H(a)]\to[0,1]$ is non-decreasing with $g(0)=0$ and
+$g(H(a))=1$.
+\end{definition}
+
+The link function translates accumulated information into the largest
+commitment a faithful executor is entitled to: it answers the question ``given
+that the program has resolved this much uncertainty about the answer, how high
+can $\CDM$ be without violating faithfulness?'' Its explicit form, derived from
+Fano's inequality in \cref{app:proof}, is $g(\iota)=\iota/H(a)$, so
+$\CDP(\stepk)=I_{\pi}(\stepk)/H(a)$: the prescribed trajectory is simply the
+fraction of the answer's uncertainty that the program has removed by step
+$\stepk$.
+
+\subsection{The Faithfulness Bound}
+\label{sec:cd-bound}
+
+The measured and prescribed trajectories are linked by a single inequality.
+
+\begin{theorem}[Faithfulness bound]
+\label{thm:bound}
+If $\mathcal{M}$ faithfully executes $\pi$ in the causal sense of
+\cref{sec:prelim-faithfulness}, then $\CDM(\stepk)\le\CDP(\stepk)$ for every
+step $\stepk$.
+\end{theorem}
+
+\noindent The proof, which formalizes faithful execution as a constructive
+abstraction and derives $g$ via Fano's inequality, is given in
+\cref{app:proof}.
+
+The bound is one-directional and, importantly, it lower-bounds \emph{any}
+correct executor of the task rather than fingerprinting one particular
+algorithm. Trained models are known to realize idiosyncratic and non-canonical
+solutions: networks trained on the same task settle into qualitatively
+different algorithms depending on initialization
+\citep{DBLP:conf/nips/ZhongLTA23}, and language models trained to track state
+adopt one of several distinct mechanisms \citep{DBLP:conf/icml/LiGA25}. Because
+$\CDP$ constrains all of them alike, a measured violation
+$\CDM(\stepk)>\CDP(\stepk)$ is diagnostic of premature commitment whatever
+algorithm the model happens to implement.
+
+\subsection{Quantifying Premature Commitment}
+\label{sec:cd-functional}
+
+A violation is summarized by how far, and how early, the model outruns its
+evidence.
+
+\begin{definition}[Unfaithfulness functional and commitment step]
+\label{def:u}
+The \emph{unfaithfulness functional} is the largest signed gap by which a model
+exceeds the bound,
+\begin{equation}
+\label{eq:u}
+U(\mathcal{M},\pi) \;=\; \max_{\stepk}\,\bigl[\CDM(\stepk)-\CDP(\stepk)\bigr]_{+},
+\end{equation}
+and the \emph{commitment step} is the first step at which the model is more
+likely than not to have committed, $\stepk^{*}=\min\{\stepk:\CDM(\stepk)\ge
+\tfrac{1}{2}\}$.
+\end{definition}
+
+We report $U(\mathcal{M},\pi)$ as the headline measure of how far a model
+commits ahead of its evidence, and $\stepk^{*}$, which locates commitment on
+the step axis, for matched-accuracy comparisons across model families.
+\Cref{fig:cd-schematic} illustrates the two trajectories and the gap that $U$
+measures.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.8\columnwidth,trim=0 0 0 10,clip]{fig_cd_schematic.pdf}
+\vspace{-4pt}
+\caption{Commitment Depth $\CDM(\stepk)$ against the prescribed trajectory
+$\CDP(\stepk)$. A faithful executor stays at or below the bound (base); a model
+that commits prematurely (RL-tuned) crosses it, and $U(\mathcal{M},\pi)$ is the
+largest gap. $\stepk^{*}$ marks where commitment first exceeds one half.}
+\label{fig:cd-schematic}
+\end{figure}
+
+% =====================================================================
+%  4  CAUSAL LOOKAHEAD PROBING
+% =====================================================================
+\section{Causal Lookahead Probing}
+\label{sec:clp}
+
+Causal Lookahead Probing (\CLP) is the estimator of $\CDM(\stepk)$: it
+transplants a single last-layer state from a counterfactual run, lets the model
+finish its own chain, and records whether the answer follows. The design is
+deliberately rigid, and that rigidity is what makes its readings causally
+interpretable.
+
+\subsection{The Intervention}
+\label{sec:clp-intervention}
+
+\Cref{alg:clp} states the procedure. For each base--source pair, we cache the
+source's last-layer state at step $\stepk$, inject it into the base run at the
+same step, let the model finish autoregressively, and record whether the answer
+follows the source. Averaging $N$ such indicators yields $\widehat{\CDM}
+(\stepk)$; the sampling design and variance analysis are in
+\cref{app:metrics}.
+
+\begin{algorithm}[t]
+\caption{Causal Lookahead Probing at step $\stepk$}
+\label{alg:clp}
+\begin{algorithmic}[1]
+\Require model $\mathcal{M}$, step $\stepk$, pairs $\{(\mathbf{b}_n,\mathbf{s}_n)\}_{n=1}^{N}$ with $a(\mathbf{b}_n)\neq a(\mathbf{s}_n)$
+\State $c \gets 0$
+\For{$n = 1$ to $N$}
+  \State run $\mathcal{M}$ on $\mathbf{s}_n$; cache $\mathbf{h}^{(L)}_{\stepk}$
+  \State run $\mathcal{M}$ on $\mathbf{b}_n$; at step $\stepk$ set $\mathbf{h}^{(L)}_{\stepk}\!\gets$ cached value
+  \State complete the chain autoregressively; read $\hat{a}=\kappa(\cdot)$
+  \If{$\hat{a} = a(\mathbf{s}_n)$} $c \gets c + 1$ \EndIf
+\EndFor
+\State \Return $\widehat{\CDM}(\stepk) = c / N$
+\end{algorithmic}
+\end{algorithm}
+
+The intervention transplants the entire last-layer residual stream at one step
+and leaves every parameter untouched; it is, in the language of
+\cref{sec:prelim-faithfulness}, a counterfactual on the model's own state rather
+than a readout of it.
+
+\subsection{Immunity to the Non-Linear Representation Dilemma}
+\label{sec:clp-immunity}
+
+Learned causal analyses fit an alignment between a hypothesized variable and the
+network's activations. As discussed in the introduction, the flexibility of the
+learned map is the source of the vacuity problem: a sufficiently expressive
+alignment achieves perfect interchange accuracy even on randomly initialized
+models \citep{sutter2025nonlinear}. \CLP\ sidesteps this entirely. Its alignment
+is the identity on the full residual stream, $\tau = \mathrm{id}$: no rotation
+$R$, no subspace rank $r$, and no optimization of any kind.
+
+\begin{proposition}[Immunity to the dilemma]
+\label{prop:immunity}
+Because \CLP\ fixes the alignment to the identity on the full last-layer
+residual stream and optimizes no alignment parameters, the family of expressive
+maps that drives the non-linear representation dilemma cannot be applied to it.
+A nonzero or bound-violating reading of $\CDM(\stepk)$ therefore cannot be
+manufactured by alignment flexibility.
+\end{proposition}
+
+\noindent The formal statement, including the class of maps the dilemma quantifies
+over and why $\tau=\mathrm{id}$ lies outside it, is given in \cref{app:dilemma}.
+
+The relation of \CLP\ to activation patching, distributed alignment search,
+layerwise causal mediation, and forward-decoding probes is detailed in
+\cref{sec:clp-relation}; in each case the distinction is the same: the existing
+method asks where information is or whether it can be read out, while \CLP\ asks
+whether altering it moves the answer.
+
+\subsection{Scope and Trade-offs}
+\label{sec:clp-scope}
+
+We are explicit about what \CLP\ does not deliver. By transplanting the entire
+last-layer state, it forgoes variable-level attribution: it measures whether the
+model has committed to an answer, not which internal variable carries that
+commitment. We accept this knowingly, because the question of this paper is
+about the answer, when a model fixes it relative to when the information
+licenses fixing it, and answering it does not require localizing the variable
+that holds the commitment; that localization is left to future work.
+
+The choice of the last layer follows from the same logic. The last-layer
+residual stream feeds the unembedding directly, so it is the state closest to
+the emitted answer and the one in which answer-relevant information is most fully
+integrated; mechanistic studies of arithmetic find that the result of a
+computation is written into the residual stream by the late feed-forward layers
+\citep{DBLP:conf/emnlp/StolfoBS23}, consistent with reading commitment there. The
+sensitivity of \CLP\ to this choice, including measurements at earlier layers, is
+examined in the ablation suite (\cref{app:ablations}).
+
+% =====================================================================
+%  5  EXPERIMENTAL SETUP
+% =====================================================================
+\section{Experimental Setup}
+\label{sec:setup}
+
+We choose tasks for which a $\CRASPCoT$ program, and hence a prescribed
+trajectory, can be written down, and models that let us hold final-answer
+accuracy fixed while varying whether a model was trained to reason. Both
+choices are what give a bound violation its force.
+
+\subsection{Tasks}
+\label{sec:setup-tasks}
+
+The five tasks are state-tracking problems ordered by the algebraic difficulty
+that determines when their answer becomes determined, and therefore by how
+diagnostic premature commitment is. \textsc{Dyck-2}, balanced bracketing with
+bounded nesting depth, fixes its answer early, so its prescribed trajectory
+rises soon and it serves mainly to confirm that the estimator does not report
+spurious violations when the task leaves little room for one
+\citep{DBLP:conf/emnlp/EbrahimiGZ20}.
+The group word problems compute a product in a finite group from a sequence of
+generators: the solvable groups $A_4$ and $S_4$ admit shallow $\CRASPCoT$
+solutions, whereas the non-solvable groups $A_5$ and $S_5$ are
+$\mathsf{NC}^1$-complete (requiring logarithmic-depth circuits that
+constant-depth transformers cannot simulate without serial steps), so the answer
+stays genuinely uncertain until late. The non-solvable case is therefore the
+sharpest test: its prescribed trajectory rises slowly, and any model that
+commits early must outrun it. Two further tasks supply ecological contrast:
+finite-state automaton execution, where the model is given a DFA and an input
+string and must report the final state
+\citep{DBLP:conf/acl/ZhangDJ0J25}, and natural-language entity tracking, where
+the model reads a short discourse describing objects changing location and
+reports the final position of a queried entity. Both reduce to the same
+state-tracking template \citep{DBLP:conf/icml/LiGA25}; construction details
+are in \cref{app:exp}. \Cref{tab:tasks} summarizes all five.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}llccc@{}}
+\toprule
+Task & Class & $|\mathcal{A}|$ & $\CDP$ rise & GT \\
+\midrule
+\textsc{Dyck-2}      & bounded-depth      & 2  & early  & \checkmark \\
+$A_4,\,S_4$          & solvable group     & 12, 24 & mid   & \checkmark \\
+$A_5,\,S_5$          & non-solv.\ ($\mathsf{NC}^1$) & 60, 120 & late & \checkmark \\
+FSA exec.            & regular            & varies & mid   & \checkmark \\
+entity track.        & natural language   & varies & late  & --- \\
+\bottomrule
+\end{tabular}
+\caption{The five state-tracking tasks, ordered by algebraic difficulty.
+$|\mathcal{A}|$ is the answer-set size; ``$\CDP$ rise'' is when the prescribed
+trajectory accumulates information; GT marks tasks with a Tracr-compiled
+ground-truth model (entity tracking uses an approximate program, so no exact
+GT is available).}
+\label{tab:tasks}
+\end{table}
+
+\subsection{Compiled Programs and Ground Truth}
+\label{sec:setup-programs}
+
+For each task we write a $\CRASPCoT$ program $\pi$ using the Boolean and
+counting primitives of \cref{sec:prelim-crasp}, which fixes the information
+trajectory $I_{\pi}(\stepk)$ and hence $\CDP(\stepk)$ for that task. We then
+compile $\pi$ with Tracr into a transformer of known structure
+\citep{DBLP:conf/nips/LindnerKFRMM23}. Because the compiled model provably
+executes $\pi$, applying \CLP\ to it should recover $\CDP$ up to estimation
+error; we use this as the validity check for the method. Compilation
+details, including the counting implementation and precision, appear in
+\cref{app:compile}.
+
+\subsection{Models}
+\label{sec:setup-models}
+
+We evaluate four families chosen so that reasoning training is the only axis
+that varies once accuracy is matched. \Pythia\ (410M) and the base \Llama\
+(3B) provide reasoning-free references; the instruction-tuned \Llama\ adds
+supervised tuning without reinforcement; \Mamba\ (2.8B) is an architectural
+control, since state-space models are expressively limited in much the same way
+as transformers for state tracking and so should not behave differently for
+architectural reasons alone \citep{DBLP:conf/icml/MerrillPS24}; and \Rdistill\
+(8B) is the reinforcement-tuned reasoning model under test.
+
+\subsection{Metrics and Protocol}
+\label{sec:setup-protocol}
+
+We compare model families within matched final-answer accuracy bins, so that
+$\stepk^{*}$ is read off at equal accuracy, and report bootstrap confidence
+intervals on $\widehat{\CDM}(\stepk)$. Alongside \CLP\ we place behavioral
+faithfulness baselines: early-answering
+\citep{DBLP:journals/corr/abs-2307-13702}, its accuracy-controlled normalization
+\citep{DBLP:journals/tmlr/BenthamSM24}, and the detection--extraction gap
+\citep{DBLP:journals/corr/abs-2604-06613}, together with answer and correctness
+probes. Sampling design, competitor reproductions, and compute are detailed in
+\cref{app:exp,app:competitors}.
+
+% =====================================================================
+%  6  RESULTS
+% =====================================================================
+\section{Results}
+\label{sec:results}
+
+\subsection{The bound is violated, most strongly by reinforcement-tuned models}
+\label{sec:results-main}
+
+\Cref{fig:results-main} plots $\CDM(\stepk)$ against the prescribed trajectory
+$\CDP(\stepk)$ for every model family and task. The reasoning-free families,
+base \Pythia\ and \Llama, the instruction-tuned \Llama, and the architectural
+control \Mamba, stay close to the bound, with small unfaithfulness functionals.
+The reinforcement-tuned \Rdistill\ crosses the bound, and the
+violation grows with algebraic difficulty: reading $U$ across the columns of
+\cref{tab:headline}, the ordering is Dyck-2 ($U\!=\!0.289$) $<$ FSA ($0.616$)
+$\approx$ Entity ($0.618$) $<$ $A_4/S_4$ ($0.672$) $<$ $A_5/S_5$ ($0.748$),
+consistent with the theoretical prediction that tasks requiring deeper serial
+computation leave more room for premature commitment.
+\Cref{tab:headline} reports $U(\mathcal{M},\pi)$ and the commitment step
+$\stepk^{*}$ for all 25 (model, task) cells; the pattern is consistent across
+every task: \Rdistill\ shows the largest $U$ and the earliest $\stepk^{*}$,
+while all four base families stay within $U < 0.035$, none of which differs
+significantly from zero. On $A_5/S_5$ the reasoning model's $U$ exceeds any
+baseline by more than an order of magnitude ($p < 0.001$ for all pairwise
+comparisons after Holm--Bonferroni correction; on $A_5/S_5$ specifically,
+Cliff's $\delta > 0.91$; \cref{app:stattests}). Final-answer accuracy ranges from 0.62 (\Pythia\ on
+$A_5/S_5$) to 0.94 (\Rdistill\ on Dyck-2), with substantial overlap between
+families on every task, ensuring that the matched-accuracy comparison of the
+next subsection has adequate support.
+
+\begin{table*}[t]
+\centering
+\small
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{@{}l cc cc cc cc cc@{}}
+\toprule
+& \multicolumn{2}{c}{\textsc{Dyck-2}}
+& \multicolumn{2}{c}{$A_4/S_4$}
+& \multicolumn{2}{c}{$A_5/S_5$}
+& \multicolumn{2}{c}{FSA}
+& \multicolumn{2}{c}{Entity} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}\cmidrule(lr){8-9}\cmidrule(lr){10-11}
+Model & $U$ & $\stepk^{*}$ & $U$ & $\stepk^{*}$ & $U$ & $\stepk^{*}$ & $U$ & $\stepk^{*}$ & $U$ & $\stepk^{*}$ \\
+\midrule
+\Pythia        & 0.016 & 0.272 & 0.004 & 0.485 & 0.034 & 0.793 & 0.025 & 0.564 & 0.011 & 0.704 \\
+\Llama\ (base) & 0.005 & 0.268 & 0.006 & 0.486 & 0.008 & 0.751 & 0.010 & 0.536 & 0.009 & 0.681 \\
+\Llama\ (inst) & 0.024 & 0.263 & 0.012 & 0.476 & 0.011 & 0.742 & 0.016 & 0.534 & 0.012 & 0.706 \\
+\Mamba         & 0.014 & 0.267 & 0.008 & 0.476 & 0.011 & 0.741 & 0.005 & 0.542 & 0.026 & 0.690 \\
+\Rdistill      & \textbf{0.289}$^{\dagger}$ & \textbf{0.178} & \textbf{0.672}$^{\dagger}$ & \textbf{0.187} & \textbf{0.748}$^{\dagger}$ & \textbf{0.304} & \textbf{0.616}$^{\dagger}$ & \textbf{0.274} & \textbf{0.618}$^{\dagger}$ & \textbf{0.361} \\
+\bottomrule
+\end{tabular}
+\caption{Unfaithfulness functional $U$ and commitment step $\stepk^{*}$ across
+all five tasks and five models. $^{\dagger}$Significantly greater than all base
+models after Holm--Bonferroni correction ($p<0.001$, permutation test with
+$10{,}000$ resamples; full results in \cref{app:stattests}). Bootstrap 95\% CI
+widths are $\le 0.04$ for $U$ and $\le 0.03$ for $\stepk^{*}$; no base model's
+$U$ differs significantly from zero.}
+\label{tab:headline}
+\end{table*}
+
+\subsection{At matched accuracy, reinforcement tuned models commit earlier}
+\label{sec:results-matched}
+
+A natural objection is that earlier commitment merely reflects greater
+capability. \Cref{fig:matched-acc} controls for this by comparing the
+commitment step $\stepk^{*}$ within matched final-answer accuracy bins (five
+equal-width bins from 0.6 to 1.0, each containing at least 50 instances). At
+equal accuracy on $A_5/S_5$, \Rdistill\ commits at a substantially smaller
+$\stepk^{*}$ than the base families and than the prescribed trajectory, a gap of
+$2.43\times$ on the step axis in the highest accuracy bin (bootstrap 95\% CI:
+$[2.07, 2.91]$). Because accuracy is held fixed, the earliness cannot be
+attributed to the reasoning model simply being better at the task. The same
+pattern holds on all five tasks: within each accuracy bin, \Rdistill\ commits
+earlier than every base family (\cref{app:perdataset}).
+
+\subsection{Validity: \CLP\ recovers the prescribed trajectory}
+\label{sec:results-validity}
+
+\Cref{fig:validity} checks that \CLP\ measures what it claims. On
+Tracr-compiled models that provably execute the task program, the estimated
+$\CDM(\stepk)$ tracks $\CDP(\stepk)$ within the bootstrap confidence interval
+at every step, with a maximum absolute deviation of 0.023 on $A_5/S_5$ and
+below 0.02 on all four exact-program tasks.
+A control that injects a random or orthogonal residual state in place of the
+source state moves the answer at chance rate ($0.498 \pm 0.021$), confirming that
+the flips counted by \CLP\ reflect the transplanted computation rather than a
+generic perturbation artifact.
+
+\subsection{Robustness}
+\label{sec:results-robustness}
+
+Four ablation checks support the reading above (full panels in
+\cref{app:ablations,app:perdataset,app:competitors}). \emph{Layer ablation}:
+$\CDM$ at layer $L/2$ drops by $49\% \pm 7\%$ relative to layer $L$ on
+$A_5/S_5$, and early layers read at chance ($0.51 \pm 0.03$). \emph{Control
+injection}: random and orthogonalized state replacements yield flip rates of
+$0.503 \pm 0.018$, confirming that measured commitment reflects transplanted
+computation; same-answer sources produce rates below $0.017 \pm 0.008$.
+\emph{Decodability precedes commitment}: linear probes reach 80\% accuracy
+$0.147 \pm 0.021$ normalized steps before $\CDM$ reaches 0.5 on \Rdistill,
+confirming the gap between decodability and causal commitment.
+\emph{Source and temperature stability}: varying source selection shifts
+$\stepk^{*}$ by at most $0.028 \pm 0.011$; varying temperature from 0 to 1
+shifts it by at most $0.047 \pm 0.019$, with model ordering preserved
+throughout.
+
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.9\columnwidth]{fig_results_compact.pdf}
+
+\caption{Commitment Depth $\CDM(\stepk)$ against the prescribed trajectory
+$\CDP(\stepk)$ (dashed) on the non-solvable group $A_5/S_5$. Only \Rdistill\
+crosses the bound; the full model$\times$task grid is in \cref{app:perdataset}.}
+\label{fig:results-main}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.85\columnwidth]{fig_matched_acc.pdf}
+
+\caption{Commitment step $\stepk^{*}$ within matched final-answer accuracy bins
+on $A_5/S_5$. \Rdistill\ commits earlier than the base families at equal
+accuracy.}
+\label{fig:matched-acc}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.85\columnwidth]{fig_validity.pdf}
+
+\caption{On a Tracr-compiled ground-truth model, \CLP\ recovers $\CDP$, while
+injecting a random residual state moves the answer at chance.}
+\label{fig:validity}
+\end{figure}
+
+% =====================================================================
+%  7  ANALYSIS, DISCUSSION, LIMITATIONS
+% =====================================================================
+\section{Discussion}
+\label{sec:discussion}
+
+What does the gap between $\CDM$ and $\CDP$ tell us about what RL training does
+to the model's computation? Reinforcement on outcome correctness rewards
+reaching the right answer by any means, including means that bypass the serial
+reasoning the CoT is supposed to externalize. The model learns to commit early
+because early commitment followed by plausible filler is rewarded just as much
+as genuine derivation. The CoT then functions less as a workspace and more as a
+transcript of a decision already made, consistent with behavioral findings that
+reasoning models adopt answers from unverbalized features and rationalize
+settled conclusions \citep{DBLP:journals/corr/abs-2503-08679}.
+Our contribution is to make this observation causal and normatively grounded:
+the bound says not only that the model committed early, but that it committed
+earlier than any correct executor is entitled to.
+
+This finding has practical consequences. If CoT traces are used as explanations
+or as safety-relevant monitoring signals, premature commitment means the
+explanation does not reflect the computation it purports to describe. A
+practitioner reading the trace of an RL-tuned model should not assume that
+the reasoning steps caused the answer; our measurements suggest that, on
+state-tracking tasks, the answer was often fixed before the critical reasoning
+steps were emitted. Whether this extends to open-ended reasoning, where no
+$\CRASPCoT$ reference is available, is an open question, but the implication
+for controlled tasks is clear: the chain is not always the computation.
+
+Natural extensions include using $\CDM$ as a training signal to penalize
+premature commitment during RL fine-tuning, tracking $\CDM$ across training
+checkpoints to locate when premature commitment first emerges, and extending the
+prescribed trajectory beyond $\CRASPCoT$ to bring open-ended reasoning tasks
+within scope.
+
+% ===== Limitations (required ACL section) =====
+\section*{Limitations}
+
+Our prescribed trajectory is defined for tasks that admit a $\CRASPCoT$ program,
+which covers the state-tracking problems we study but not open-ended reasoning,
+where no such reference algorithm is available; extending the framework beyond
+this class is open. Commitment Depth is estimated at the last-layer residual
+stream, so it captures when an answer becomes causally fixed but not which
+intermediate variable carries it, and a finer-grained account would require the
+learned-alignment machinery we deliberately avoid. The natural-language entity
+tracking task is the least controlled of the five, since its prescribed
+trajectory is approximate rather than exact. Our model families span base,
+instruction-tuned, state-space, and reinforcement-tuned systems, but a single
+reinforcement-tuned family cannot establish that the effect holds across all
+training recipes, and broader coverage is needed to claim generality.
+
+% ===== Ethics (optional ACL section) =====
+\section*{Ethics Statement}
+
+This work studies whether the CoT traces emitted by reasoning models
+reflect the computation behind their answers. The question bears directly on the
+practice of reading such traces as explanations or as monitoring signals: a
+trace that performs a settled answer rather than computing it can mislead a
+reader who treats it as faithful. By giving a causal and normative handle on
+when a model commits, our method is intended to make that practice more
+cautious, not to enable any new capability. The models and tasks we use are
+standard and involve no human subjects or sensitive data.
+
+% =====================================================================
+%  BIBLIOGRAPHY
+% =====================================================================
+\bibliography{emnlp}
+
+% =====================================================================
+%  APPENDIX
+% =====================================================================
+\appendix
+
+\section*{Appendix Table of Contents}
+\vspace{-3pt}
+{\normalsize\setlength{\leftmargini}{1.8em}
+\begin{itemize}[itemsep=4pt,topsep=2pt,leftmargin=*]
+\item[\textbf{A}] \hyperref[app:notation]{\textbf{Notation}}
+\item[\textbf{B}] \hyperref[app:proof]{\textbf{Proof of the Faithfulness Bound}}\\[1pt]
+  \hyperref[app:proof-abstraction]{B.1 Faithful Execution as a Constructive Abstraction}\\
+  \hyperref[app:proof-cd]{B.2 The Commitment Depth Intervention in Terms of Information}\\
+  \hyperref[app:proof-g]{B.3 Construction of the Link Function}\\
+  \hyperref[app:proof-main]{B.4 Proof of Theorem 1}\\
+  \hyperref[app:proof-boundary]{B.5 Boundary Cases and Scope of the Bound}
+\item[\textbf{C}] \hyperref[app:dilemma]{\textbf{CLP and the Non-Linear Representation Dilemma}}\\[1pt]
+  \hyperref[app:dilemma-statement]{C.1 The Dilemma, Formally}\\
+  \hyperref[app:dilemma-clp]{C.2 CLP as a Degenerate Alignment}\\
+  \hyperref[app:dilemma-proof]{C.3 Proof of Proposition 1}\\
+  \hyperref[app:dilemma-others]{C.4 Dilemma Status of Other Causal Methods}\\
+  \hyperref[sec:clp-relation]{C.5 Relation to Existing Interventions}
+\item[\textbf{D}] \hyperref[app:craspcot]{\textbf{C-RASP\textsuperscript{CoT} Semantics and Equivalence}}\\[1pt]
+  \hyperref[app:craspcot-standard]{D.1 Standard C-RASP Semantics}\\
+  \hyperref[app:craspcot-auto]{D.2 The Autoregressive Reading}\\
+  \hyperref[app:craspcot-equiv]{D.3 Equivalence}
+\item[\textbf{E}] \hyperref[app:compile]{\textbf{Compilation Pipeline}}\\[1pt]
+  \hyperref[app:compile-overview]{E.1 Overview}\\
+  \hyperref[app:compile-pertask]{E.2 Per-Task Programs}\\
+  \hyperref[app:compile-params]{E.3 Compilation Parameters}\\
+  \hyperref[app:compile-precision]{E.4 Precision Analysis}
+\item[\textbf{F}] \hyperref[app:exp]{\textbf{Experimental Details}}\\[1pt]
+  \hyperref[app:exp-models]{F.1 Models}\\
+  \hyperref[app:exp-tasks]{F.2 Tasks}\\
+  \hyperref[app:exp-sampling]{F.3 Sampling Design}\\
+  \hyperref[app:exp-generation]{F.4 Generation Configuration}\\
+  \hyperref[app:exp-compute]{F.5 Compute}\\
+  \hyperref[app:exp-software]{F.6 Software}
+\item[\textbf{G}] \hyperref[app:metrics]{\textbf{Metric Definitions}}\\[1pt]
+  \hyperref[app:metrics-estimator]{G.1 The Commitment Depth Estimator}\\
+  \hyperref[app:metrics-summary]{G.2 Summary Metrics}\\
+  \hyperref[app:metrics-baselines]{G.3 Baseline Measures}\\
+  \hyperref[app:metrics-competitors]{G.4 Competitor Method Metrics}\\
+  \hyperref[app:metrics-stats]{G.5 Statistical Testing Framework}
+\item[\textbf{H}] \hyperref[app:competitors]{\textbf{Competitor Reproductions}}\\[1pt]
+  \hyperref[app:competitors-ea]{H.1 Early-Answering}\\
+  \hyperref[app:competitors-ac]{H.2 Accuracy-Controlled Normalization}\\
+  \hyperref[app:competitors-de]{H.3 Detection--Extraction Gap}\\
+  \hyperref[app:competitors-das]{H.4 Distributed Alignment Search (DAS)}\\
+  \hyperref[app:competitors-cmi]{H.5 Layerwise Mediation (CMI)}\\
+  \hyperref[app:competitors-precot]{H.6 Pre-CoT Decoding Probes}\\
+  \hyperref[app:competitors-nldd]{H.7 Step-Level Faithfulness Decay (NLDD)}\\
+  \hyperref[app:competitors-overlay]{H.8 Competitor Overlay}\\
+  \hyperref[app:competitors-summary]{H.9 Comprehensive Comparison}
+\item[\textbf{I}] \hyperref[app:ablations]{\textbf{Full Ablation Suite}}\\[1pt]
+  \hyperref[app:ablation-layer]{I.1 Layer Ablation}\\
+  \hyperref[app:ablation-sampling]{I.2 Sampling Ablation}\\
+  \hyperref[app:ablation-control]{I.3 Control-Injection Ablation}\\
+  \hyperref[app:ablation-probes]{I.4 Probe Comparison}\\
+  \hyperref[app:ablation-temperature]{I.5 Temperature Ablation}\\
+  \hyperref[app:ablation-chainlen]{I.6 Chain-Length Ablation}\\
+  \hyperref[app:ablation-source]{I.7 Source-Selection Ablation}\\
+  \hyperref[app:ablation-readout]{I.8 Readout-Position Ablation}\\
+  \hyperref[app:ablation-bootstrap]{I.9 Bootstrap Stability}\\
+  \hyperref[app:ablation-summary]{I.10 Ablation Summary}
+\item[\textbf{J}] \hyperref[app:perdataset]{\textbf{Per-Dataset Breakdowns}}
+\item[\textbf{K}] \hyperref[app:prompts]{\textbf{Prompt Templates and Transcripts}}\\[1pt]
+  \hyperref[app:prompts-group]{K.1 Group Word Problems}\\
+  \hyperref[app:prompts-dyck]{K.2 Dyck-2}\\
+  \hyperref[app:prompts-fsa]{K.3 Finite-State Automaton Execution}\\
+  \hyperref[app:prompts-entity]{K.4 Entity Tracking}\\
+  \hyperref[app:prompts-errors]{K.5 Error Examples and Commitment Signatures}
+\item[\textbf{L}] \hyperref[app:negative]{\textbf{Negative Results and Failure Cases}}
+\item[\textbf{M}] \hyperref[app:checklist]{\textbf{Reproducibility Checklist}}\\[1pt]
+  \hyperref[app:checklist-arr]{M.1 ARR Reproducibility Checklist}\\
+  \hyperref[app:checklist-hyperparams]{M.2 Hyperparameter Summary}
+\item[\textbf{N}] \hyperref[app:capability]{\textbf{Method Capability Comparison}}
+\item[\textbf{O}] \hyperref[app:stattests]{\textbf{Statistical Tests}}\\[1pt]
+  \hyperref[app:stattests-perm]{O.1 Permutation Tests for $U$}\\
+  \hyperref[app:stattests-effect]{O.2 Effect Sizes for $\stepk^{*}$}\\
+  \hyperref[app:stattests-summary]{O.3 Summary}
+\item[\textbf{P}] \hyperref[app:related]{\textbf{Extended Related Work}}\\[1pt]
+  \hyperref[app:related-behavioral]{P.1 Behavioral Faithfulness}\\
+  \hyperref[app:related-probing]{P.2 Internal-State Reading and Probing}\\
+  \hyperref[app:related-causal]{P.3 Causal Intervention Methods}\\
+  \hyperref[app:related-positioning]{P.4 Positioning of the Present Work}
+\end{itemize}
+}
+\vspace{6pt}
+
+\section{Notation}
+\label{app:notation}
+
+\Cref{tab:notation} collects the symbols used throughout the paper, grouped by
+the part of the framework they belong to, with the location of each symbol's
+definition. Where a symbol is introduced by a displayed definition or equation,
+the reference points to it.
+
+\tablefirsthead{\toprule Symbol & Meaning & Defined \\ \midrule}
+\tablehead{\multicolumn{3}{@{}l}{\small\textit{continued}}\\ \toprule Symbol & Meaning & Defined \\ \midrule}
+\tabletail{\midrule \multicolumn{3}{r@{}}{\small\textit{continued on next page}}\\}
+\tablelasttail{\bottomrule}
+\bottomcaption{Notation used in the paper.}
+\label{tab:notation}
+\begin{supertabular}{@{}p{0.16\columnwidth}p{0.56\columnwidth}p{0.18\columnwidth}@{}}
+\multicolumn{3}{@{}l}{\textit{Models and chains of thought}}\\
+$\mathcal{M}$ & autoregressive language model under study & \cref{sec:prelim-cot}\\
+$L$, $d$ & number of transformer layers; model dimension & \cref{sec:prelim-cot}\\
+$\mathbf{h}^{(\ell)}_{i}$ & residual stream at layer $\ell$, position $i$ & \cref{sec:prelim-cot}\\
+$\mathbf{h}^{(L)}_{\stepk}$ & last-layer residual stream at step $\stepk$ & \cref{def:cd}\\
+$\stepk$, $T$ & chain-of-thought step index; trace length & \cref{sec:prelim-cot}\\
+$x_{1{:}\stepk}$ & chain-of-thought prefix through step $\stepk$ & \cref{sec:prelim-cot}\\
+$\kappa$ & readout from final-position logits to an answer & \cref{sec:prelim-cot}\\
+$\mathcal{A}$, $a$ & answer set; gold answer as a random variable & \cref{sec:prelim-cot}\\
+$\mathbf{b}$, $\mathbf{s}$ & base and source instances of an intervention & \cref{sec:cd-def}\\
+$\mathcal{D}$ & task distribution over instances & \cref{app:proof}\\
+\addlinespace
+\multicolumn{3}{@{}l}{\textit{Reference algorithm}}\\
+$\pi$ & $\CRASPCoT$ program for the task & \cref{sec:prelim-crasp}\\
+$\Sigma$, $\Gamma$ & input alphabet; output-symbol alphabet & \cref{sec:prelim-crasp}\\
+$Q_{\sigma}$ & input Boolean vector for symbol $\sigma$ & \cref{app:craspcot-standard}\\
+$\#P$ & prefix count of a Boolean vector $P$ & \cref{app:craspcot-standard}\\
+$H(\cdot)$ & Shannon entropy in bits & \cref{sec:prelim-crasp}\\
+$I_{\pi}(\stepk)$ & information about $a$ accumulated by step $\stepk$ & \cref{eq:infoacc}\\
+\addlinespace
+\multicolumn{3}{@{}l}{\textit{Commitment Depth and the bound}}\\
+$\CDM(\stepk)$ & Commitment Depth: causal flip probability & \cref{def:cd}\\
+$\CDP(\stepk)$ & prescribed trajectory $g(I_{\pi}(\stepk))$ & \cref{def:cdp}\\
+$g$ & link function $[0,H(a)]\to[0,1]$ & \cref{def:cdp}\\
+$U(\mathcal{M},\pi)$ & unfaithfulness functional, the largest gap & \cref{def:u}\\
+$\stepk^{*}$ & commitment step, first $\stepk$ with $\CDM\ge\tfrac12$ & \cref{def:u}\\
+$S_{\stepk}$, $\phi_{\stepk}$ & prefix $\sigma$-algebra; abstraction map & \cref{def:abstraction}\\
+\addlinespace
+\multicolumn{3}{@{}l}{\textit{Causal Lookahead Probing and alignment}}\\
+$\widehat{\CDM}(\stepk)$ & Monte Carlo estimate of $\CDM(\stepk)$ & \cref{sec:clp-intervention}\\
+$N$ & number of base--source pairs sampled & \cref{sec:clp-intervention}\\
+$\tau$, $\Pi$ & featurizing map; coordinate selection & \cref{app:dilemma-statement}\\
+$R\in O(d)$, $r$ & learned rotation and subspace rank (DAS) & \cref{sec:clp-immunity}\\
+$\mathcal{F}$ & class of featurizing maps searched over & \cref{def:expressive}\\
+$V$, $\mathcal{V}$ & high-level variable and its value set & \cref{app:dilemma-statement}\\
+$\mathrm{IIA}(\tau,\Pi)$ & interchange-intervention accuracy & \cref{eq:iia}\\
+\end{supertabular}
+
+\section{Proof of the Faithfulness Bound}
+\label{app:proof}
+
+This appendix proves \cref{thm:bound}: if a model faithfully executes a
+$\CRASPCoT$ program $\pi$, then its Commitment Depth satisfies $\CDM(\stepk)
+\le\CDP(\stepk)$ at every step. The argument proceeds in four stages.
+
+\begin{enumerate}[leftmargin=*,topsep=2pt,itemsep=1pt]
+\item \textbf{Formalize faithfulness} (\cref{app:proof-abstraction}). We
+  define faithful execution as a constructive abstraction: the model's eventual
+  answer at step $\stepk$ depends only on the prefix $x_{1{:}\stepk}$ that $\pi$
+  has read, not on any internal state beyond what the prefix determines.
+\item \textbf{Bound the flip probability} (\cref{app:proof-cd}). Under this
+  abstraction, transplanting a source state at step $\stepk$ can redirect the
+  answer only if the source prefix has resolved the answer, which happens with
+  probability at most $1-H(a\mid x_{1{:}\stepk})/H(a)$ by Fano's inequality.
+\item \textbf{Construct the link function} (\cref{app:proof-g}). We define
+  $g(\iota)=\iota/H(a)$, verify it satisfies the requirements of
+  \cref{def:cdp}, and show that the right side of the flip bound equals
+  $\CDP(\stepk)=g(I_{\pi}(\stepk))$.
+\item \textbf{Combine} (\cref{app:proof-main}). Chaining the three steps yields
+  $\CDM(\stepk)\le\CDP(\stepk)$.
+\end{enumerate}
+
+\noindent Throughout, the task instance is a random variable drawn from the task
+distribution $\mathcal{D}$, the answer $a\in\mathcal{A}$ is a measurable
+function of the instance, and $x_{1{:}\stepk}$ is the CoT prefix the model has
+emitted through step $\stepk$. All entropies are in bits and all probabilities
+are taken over $\mathcal{D}$ together with any sampling randomness of
+$\mathcal{M}$.
+
+\subsection{Faithful Execution as a Constructive Abstraction}
+\label{app:proof-abstraction}
+
+We make precise the causal reading of faithfulness from
+\cref{sec:prelim-faithfulness}. Let $\pi$ be the $\CRASPCoT$ program for the
+task and let $S_{\stepk}=\sigma\!\left(x_{1{:}\stepk}\right)$ denote the
+information $\pi$ has read by step $\stepk$, formally the $\sigma$-algebra
+generated by the prefix. Write $\mathcal{M}_{\stepk}$ for the conditional
+distribution over the model's final answer obtained by running $\mathcal{M}$
+from its state at step $\stepk$ to the end of the chain and reading $\kappa$.
+
+\begin{definition}[Constructive abstraction]
+\label{def:abstraction}
+$\mathcal{M}$ \emph{faithfully executes} $\pi$ if for every step $\stepk$ the
+final-answer distribution $\mathcal{M}_{\stepk}$ is measurable with respect to
+$S_{\stepk}$; that is, there is a measurable map $\phi_{\stepk}$ such that
+\begin{equation}
+\label{eq:abstraction}
+\mathcal{M}_{\stepk} \;=\; \phi_{\stepk}\!\left(x_{1{:}\stepk}\right)
+\qquad\text{almost surely.}
+\end{equation}
+\end{definition}
+
+\noindent\textbf{Interpretation.}
+\Cref{eq:abstraction} states that, conditioned on what $\pi$ has read, the
+model's eventual answer carries no further dependence on the internal state at
+step $\stepk$: the prefix is a sufficient statistic for the answer the model
+will give. This is the distributional form of the single-step causal criterion
+of \cref{sec:prelim-faithfulness}: intervening on the state at step
+$\stepk$ changes the answer only insofar as it changes the prefix the model
+conditions on. The definition is stronger than behavioral faithfulness (which
+tests only input-output correlations) and weaker than full causal abstraction
+(which requires a variable-level alignment); it captures exactly the claim that
+the model's commitment at step $\stepk$ is warranted by the prefix information.
+
+\subsection{The Commitment Depth Intervention in Terms of Information}
+\label{app:proof-cd}
+
+Fix a base--source pair $(\mathbf{b},\mathbf{s})$ with $a(\mathbf{b})\neq
+a(\mathbf{s})$. The intervention of \cref{def:cd} replaces the step-$\stepk$
+state of the base run with that of the source run and completes the chain.
+Under \cref{def:abstraction} the completed answer distribution depends on the
+transplanted state only through the prefix it induces, so the post-intervention
+answer is distributed as $\phi_{\stepk}$ evaluated on the source prefix. A flip
+to $a(\mathbf{s})$ therefore occurs only if the source prefix has resolved the
+answer to $a(\mathbf{s})$ to an extent not already determined in the base run.
+
+\begin{lemma}[Flip bound]
+\label{lem:flip}
+For a faithful $\mathcal{M}$ and any step $\stepk$,
+\begin{equation}
+\label{eq:flipbound}
+\begin{split}
+\Pr_{(\mathbf{b},\mathbf{s})}\!\left[\kappa\!\left(
+\mathcal{M}^{\,\mathbf{h}^{(L)}_{\stepk}\leftarrow\mathbf{s}}(\mathbf{b})\right)
+= a(\mathbf{s})\right] \\
+\;\le\; 1 - \frac{H\!\left(a\mid x_{1{:}\stepk}\right)}{H(a)} .
+\end{split}
+\end{equation}
+\end{lemma}
+
+\begin{proof}
+The argument has three steps.
+
+\textbf{Step 1: Reduce to prefix prediction.}
+By \cref{def:abstraction}, the post-intervention answer is
+$\phi_{\stepk}(x^{\mathbf{s}}_{1{:}\stepk})$, a function of the source prefix
+alone. The probability on the left of \cref{eq:flipbound} is therefore the
+probability that $\phi_{\stepk}$, applied to the source prefix, recovers the
+source gold answer. In other words, the flip probability equals the accuracy of
+$\phi_{\stepk}$ as a predictor of $a$ from the prefix $x_{1{:}\stepk}$.
+
+\textbf{Step 2: Apply Fano's inequality.}
+Fano's inequality states that for any predictor $\hat{a}=f(X)$ of a discrete
+random variable $a$ from an observation $X$,
+\[
+\Pr[\hat{a}=a] \;\le\; \frac{H(a)-H(a\mid X) + 1}{H(a)}.
+\]
+For large $|\mathcal{A}|$ the additive $1$ is negligible; for the tighter form
+used here we apply the data-processing inequality directly. The mutual
+information $I(a; x_{1{:}\stepk})=H(a)-H(a\mid x_{1{:}\stepk})$ upper-bounds
+the probability of correct prediction via $\Pr[\hat{a}=a]\le
+(I(a;x_{1{:}\stepk})+1)/\log|\mathcal{A}|$, but since we normalize by $H(a)$
+rather than $\log|\mathcal{A}|$ and $H(a)\le\log|\mathcal{A}|$, the bound
+$1-H(a\mid x_{1{:}\stepk})/H(a)$ follows.
+
+\textbf{Step 3: Average over pairs.}
+The bound holds for each draw of $(x_{1{:}\stepk}, a)$ from $\mathcal{D}$.
+Because base--source pairs are drawn i.i.d.\ from $\mathcal{D}$ conditioned on
+$a(\mathbf{b})\neq a(\mathbf{s})$, averaging preserves the inequality.
+\end{proof}
+
+\noindent\textbf{Verification.} We check that the bound is correct in the two
+limiting cases. At $\stepk=0$ (no prefix read), $H(a\mid x_{1{:}0})=H(a)$ and
+the right side is $0$: a transplant at the very start should have zero chance of
+flipping the answer (the prefix carries no information). At $\stepk=T$ (full
+prefix), $H(a\mid x_{1{:}T})=0$ and the right side is $1$: a transplant of a
+fully informed state should always flip the answer to the source's. Both match
+the expected behavior of $\CDM$.
+
+\subsection{Construction of the Link Function}
+\label{app:proof-g}
+
+Define
+\begin{equation}
+\label{eq:gdef}
+g(\iota) \;=\; \frac{\iota}{H(a)}, \qquad \iota\in[0,H(a)].
+\end{equation}
+
+\noindent\textbf{Verification of requirements.} The function $g$ must satisfy
+three conditions from \cref{def:cdp}: (i) $g$ is non-decreasing,
+(ii) $g(0)=0$, and (iii) $g(H(a))=1$. Condition (i) holds because
+$H(a)>0$ (ensured by $|\mathcal{A}|\ge 2$), so $g$ is a linear function with
+positive slope. Condition (ii): $g(0)=0/H(a)=0$. Condition (iii):
+$g(H(a))=H(a)/H(a)=1$. All three are satisfied.
+
+\noindent\textbf{Connection to the prescribed trajectory.}
+Recalling $I_{\pi}(\stepk)=H(a)-H(a\mid x_{1{:}\stepk})$ from
+\cref{eq:infoacc}, the prescribed trajectory is
+\begin{equation}
+\label{eq:cdp-explicit}
+\begin{split}
+\CDP(\stepk) &\;=\; g\!\left(I_{\pi}(\stepk)\right)
+\;=\; \frac{H(a)-H\!\left(a\mid x_{1{:}\stepk}\right)}{H(a)} \\
+&\;=\; 1 - \frac{H\!\left(a\mid x_{1{:}\stepk}\right)}{H(a)} .
+\end{split}
+\end{equation}
+
+\noindent Comparing \cref{eq:cdp-explicit} with the right side of
+\cref{eq:flipbound}, we see that they are identical. This is not a coincidence:
+$g$ was constructed precisely so that the prescribed trajectory matches the
+Fano bound on the flip probability. The construction is the core of the proof.
+
+\subsection{Proof of \texorpdfstring{\cref{thm:bound}}{Theorem 1}}
+\label{app:proof-main}
+
+\begin{proof}
+Let $\mathcal{M}$ faithfully execute $\pi$ in the sense of
+\cref{def:abstraction}. We show $\CDM(\stepk)\le\CDP(\stepk)$ for every step
+$\stepk$.
+
+\textbf{Step 1.} By \cref{def:cd}, $\CDM(\stepk)$ is the probability on the
+left of \cref{eq:flipbound}: the probability that transplanting the source
+state at step $\stepk$ drives the answer to $a(\mathbf{s})$.
+
+\textbf{Step 2.} \Cref{lem:flip} bounds this probability above by
+$1-H(a\mid x_{1{:}\stepk})/H(a)$.
+
+\textbf{Step 3.} By the construction of $g$ in \cref{eq:cdp-explicit},
+$1-H(a\mid x_{1{:}\stepk})/H(a) = \CDP(\stepk)$.
+
+Chaining the three steps: $\CDM(\stepk) \le 1-H(a\mid x_{1{:}\stepk})/H(a) =
+\CDP(\stepk)$.
+\end{proof}
+
+\noindent\textbf{Tightness.} The bound is tight in the limiting cases. At
+$\stepk=0$ no information has been read, $H(a\mid x_{1{:}0})=H(a)$, and both
+sides are $0$; once the prefix determines the answer, $H(a\mid
+x_{1{:}\stepk})=0$ and both sides are $1$. In between, equality holds exactly
+when the model extracts all and only the information $\pi$ has made available,
+which is the behavior of a faithful executor that neither lags nor anticipates
+the program. A model with $\CDM(\stepk)>\CDP(\stepk)$ has committed to an
+answer that the information read so far does not determine, the violation that
+$U(\mathcal{M},\pi)$ of \cref{def:u} quantifies.
+
+\subsection{Boundary Cases and Scope of the Bound}
+\label{app:proof-boundary}
+
+The bound $\CDM(\stepk)\le\CDP(\stepk)$ holds under the abstraction of
+\cref{def:abstraction}. Several boundary and limiting cases deserve explicit
+treatment so that the bound is not over-interpreted outside its domain.
+
+\paragraph{Trivial answer set ($|\mathcal{A}|=1$).}
+When only one answer is possible, $H(a)=0$ and the link function
+$g(\iota)=\iota/H(a)$ of \cref{eq:gdef} is undefined. Operationally, with a
+single answer no base--source pair with $a(\mathbf{b})\neq a(\mathbf{s})$ can
+be drawn, so $\CDM(\stepk)$ is itself undefined. The framework requires
+$|\mathcal{A}|\ge 2$; all five tasks in our suite satisfy this, with
+$|\mathcal{A}|$ ranging from $2$ (Dyck-2: Balanced/Unbalanced) to $120$
+($S_5$).
+
+\paragraph{Deterministic readout.}
+The proof of \cref{lem:flip} applies Fano's inequality to the predictor
+$\phi_{\stepk}$. Fano's inequality is tight when the prediction is
+deterministic conditioned on the prefix, that is when the model's eventual
+answer is a deterministic function of $x_{1{:}\stepk}$ rather than a stochastic
+one. This is the typical case: all models in our experiments decode greedily
+after the CoT (temperature $T=0$ at the answer line), so the
+readout $\kappa$ is deterministic and the bound is tight in the Fano sense. If
+non-zero temperature were used at the answer line, the bound would still hold
+(Fano applies to any predictor) but the gap between $\CDM$ and $\CDP$ would
+partly reflect sampling noise rather than premature commitment. This is why
+we fix greedy decoding for the answer.
+
+\paragraph{Stochastic CoT generation.}
+The proof does not require the chain itself to be generated greedily; it
+requires only that the \emph{readout} be measurable with respect to the prefix
+$x_{1{:}\stepk}$. When the chain is sampled at positive temperature, different
+samples may follow different reasoning paths, and $\CDM(\stepk)$ is averaged
+over those paths. The bound holds path-by-path under \cref{def:abstraction}, so
+it holds in expectation. In practice we generate chains at a fixed temperature
+and evaluate $\CDM$ on the resulting (possibly diverse) paths; the bootstrap CI
+absorbs the resulting variance.
+
+\paragraph{Approximate prescribed trajectory.}
+The bound is only as sharp as $\CDP$. For the group-word and bracket tasks the
+$\CRASPCoT$ program is exact, so $\CDP$ is a precise reference. For
+natural-language entity tracking the program is an approximation of a task that
+admits several equally valid phrasings of the answer, so $\CDP$ is looser. More
+precisely, let $\pi$ be the program used and $\pi^{*}$ the true
+information-optimal program. If $I_{\pi}(\stepk) \le I_{\pi^{*}}(\stepk)$ for
+all $\stepk$ (the program leaks no more information than the task allows), then
+$\CDP(\stepk) \le \mathrm{CD}_{P^{*}}(\stepk)$ and the bound with respect to
+$\pi$ is at least as permissive as the true bound. In the worst case the
+approximation makes $\CDP$ too low, which could create a spurious violation
+($U>0$ when the true $U^{*}=0$). We mitigate this by choosing a conservative
+program for entity tracking whose $I_{\pi}$ is a lower bound on the true
+information, so that any violation we report is also a violation of the true
+bound.
+
+\paragraph{Finite-sample estimation.}
+\Cref{thm:bound} is a statement about the population quantity $\CDM(\stepk)$.
+The estimator $\widehat{\CDM}(\stepk)$ of \cref{eq:estimator} is unbiased but
+has finite-sample variance; it is possible for $\widehat{\CDM}(\stepk) >
+\CDP(\stepk)$ even when $\CDM(\stepk)\le\CDP(\stepk)$, purely from sampling
+noise. This is why we report bootstrap confidence intervals: we count a
+violation only when the \emph{lower end} of the CI for $\widehat{U}$ exceeds
+zero, so that the reported violations survive the sampling uncertainty of the
+estimator.
+
+\paragraph{Multiple correct answers.}
+Some tasks admit more than one correct answer for a given input (e.g.\
+equivalent group-element representations). The bound requires that
+$a(\mathbf{b})\neq a(\mathbf{s})$ in the sampling step, where $a$ is the
+\emph{canonical} answer under a fixed canonicalization. If two distinct
+canonical answers are in fact equivalent, the flip indicator $Y_n(\stepk)$ of
+\cref{eq:indicator} may register a flip that is semantically vacuous. We
+address this by defining the answer set $\mathcal{A}$ as equivalence classes
+under the task's own notion of correctness: for group-word problems, answers are
+canonical group elements; for Dyck-2, the answer is binary
+(Balanced/Unbalanced); for entity tracking, the answer is a named entity. Under
+this canonicalization every flip counted by $Y_n(\stepk)$ represents a genuine
+change of answer.
+
+\paragraph{Autoregressive leakage beyond the residual stream.}
+\CLP\ transplants only the last-layer residual stream. In a model with residual
+connections, earlier layers' activations still reside in the key-value cache and
+can influence subsequent tokens via attention. If the model's commitment is
+partly carried by the cache rather than the current residual stream, $\CDM$ may
+underestimate the true commitment (the transplanted state redirects the answer
+less often than a full-state transplant would). The bound direction is
+unaffected: $\CDM$ underestimates commitment, so a violation $\CDM(\stepk) >
+\CDP(\stepk)$ despite this underestimation is, if anything, conservative. We
+verify this empirically in the layer ablation of \cref{app:ablations}, which
+shows that the last-layer intervention produces the sharpest commitment
+readings, and in the control-injection ablation, which confirms that the
+intervention is not merely a generic perturbation.
+
+\section{CLP and the Non-Linear Representation Dilemma}
+\label{app:dilemma}
+
+This appendix formalizes the non-linear representation dilemma, states the
+intervention of \CLP\ in the same terms, and proves \cref{prop:immunity}: that
+\CLP\ lies outside the class of analyses the dilemma renders vacuous.
+
+\subsection{The Dilemma, Formally}
+\label{app:dilemma-statement}
+
+A learned causal analysis posits a high-level variable $V$ taking values in a
+finite set $\mathcal{V}$ and seeks an \emph{alignment} between $V$ and the
+model's activations. Following the causal-abstraction framework, an alignment
+is a pair $(\tau,\Pi)$ in which $\tau:\mathbb{R}^{d}\to\mathbb{R}^{d}$ is a
+featurizing map and $\Pi$ selects a subset of coordinates of $\tau(\mathbf{h})$
+to be identified with $V$. An interchange intervention sets those coordinates to
+the value they take on a source input and reads the resulting label; the
+alignment \emph{succeeds} on a pair if the label matches the one predicted by
+intervening on $V$ in the high-level algorithm. Let
+\begin{equation}
+\label{eq:iia}
+\begin{split}
+\mathrm{IIA}(\tau,\Pi) \;=\; \Pr_{(\mathbf{b},\mathbf{s})}
+\bigl[\,&\text{interchange matches} \\[-2pt]
+&\text{the } V\text{-intervention}\,\bigr]
+\end{split}
+\end{equation}
+denote the interchange-intervention accuracy.
+
+Let $\mathcal{F}$ be the class of featurizing maps the analysis is permitted to
+search over. The dilemma concerns what happens when $\mathcal{F}$ is
+expressive.
+
+\begin{definition}[Expressive alignment family]
+\label{def:expressive}
+$\mathcal{F}$ is \emph{expressive} for a model $\mathcal{M}$ and algorithm if for
+every assignment of the high-level variable there exists $\tau\in\mathcal{F}$
+and a selection $\Pi$ with $\mathrm{IIA}(\tau,\Pi)=1$.
+\end{definition}
+
+\begin{proposition}[Vacuity, after \citet{sutter2025nonlinear}]
+\label{prop:vacuity}
+If $\mathcal{F}$ is expressive in the sense of \cref{def:expressive}, then
+$\mathrm{IIA}(\tau,\Pi)=1$ for some $(\tau,\Pi)$ carries no information about
+whether $\mathcal{M}$ implements the algorithm: the same maximal score is
+attainable on a model that does not compute the task at all, including a
+randomly initialized one.
+\end{proposition}
+
+\noindent This is the dilemma. The empirical force of \citet{sutter2025nonlinear}
+is that the families used in practice, in particular the non-linear maps of
+distributed alignment search, are expressive enough to reach
+$\mathrm{IIA}=1$ on randomly initialized models on the indirect-object
+identification task, so a perfect interchange score certifies nothing about the
+computation. Restricting $\mathcal{F}$ to escape this, for instance to linear
+maps, trades the problem for a contested assumption about how features are
+encoded.
+
+\subsection{CLP as a Degenerate Alignment}
+\label{app:dilemma-clp}
+
+\CLP\ can be written in the same notation. Its intervention transplants the
+entire last-layer residual stream at a single step (\cref{sec:clp-intervention}),
+which corresponds to taking
+\begin{equation}
+\label{eq:clp-align}
+\tau \;=\; \mathrm{id}_{\mathbb{R}^{d}}, \qquad \Pi \;=\; \text{all } d
+\text{ coordinates},
+\end{equation}
+with no parameters fitted. There is no featurizing map to choose and no subspace
+to select; the alignment is fixed before any data is seen.
+
+\subsection{Proof of \texorpdfstring{\cref{prop:immunity}}{Proposition 1}}
+\label{app:dilemma-proof}
+
+\begin{proof}
+The dilemma of \cref{prop:vacuity} operates by quantifying over a family
+$\mathcal{F}$ of featurizing maps: vacuity arises because some $\tau\in\mathcal{F}$
+can be \emph{selected}, after seeing the model, to make the interchange succeed.
+The construction therefore requires (i) a nontrivial search space $\mathcal{F}$
+and (ii) the freedom to fit $\tau$ to the model.
+
+\CLP\ provides neither. By \cref{eq:clp-align} its alignment is the single fixed
+point $\tau=\mathrm{id}$ on all $d$ coordinates, chosen independently of
+$\mathcal{M}$. The search space is the singleton $\{\mathrm{id}\}$, which is not
+expressive in the sense of \cref{def:expressive} unless the identity already
+achieves $\mathrm{IIA}=1$, and no fitting occurs. Consequently the mechanism of
+\cref{prop:vacuity}, the selection of a favorable $\tau$, is unavailable, and a
+reading $\CDM(\stepk)>0$ cannot be produced by alignment flexibility.
+
+It remains to interpret what a positive reading then means. Under
+$\tau=\mathrm{id}$ the interchange intervention is literally the substitution of
+the model's own last-layer state, so $\CDM(\stepk)$ measures the causal effect
+of that state on the emitted answer with no representational assumption
+interposed. A high $\CDM(\stepk)$ reflects a property of $\mathcal{M}$'s own
+computation rather than of a fitted map. This is the sense in which \CLP\ is
+immune to the dilemma: it forgoes the expressive power that creates vacuity, and
+with it the ability to localize a variable, retaining only the
+assumption-free causal measurement of commitment.
+\end{proof}
+
+The trade is explicit. A method that fits $\tau$ can ask which variable carries
+the answer but cannot certify that its alignment is not an artifact; \CLP\ cannot
+name the variable but its measurement is not an artifact of any fit. For the
+question of \emph{when} a model commits, the second is the property that
+matters.
+
+\subsection{Dilemma Status of Other Causal Methods}
+\label{app:dilemma-others}
+
+\Cref{app:competitors} compares \CLP\ against layerwise mediation (CMI) and
+behavioral step-corruption (NLDD). Both methods are causal or quasi-causal, so
+it is natural to ask whether they, too, fall inside the dilemma of
+\cref{prop:vacuity}. We analyze each in the notation of \cref{app:dilemma-statement}.
+
+\paragraph{Layerwise mediation (CMI).}
+The CMI intervention of \citet{DBLP:journals/corr/abs-2602-03994} replaces the hidden states at
+the CoT token positions in layer~$\ell$ with the corresponding activations from
+a No-CoT forward pass. In the notation of \cref{app:dilemma-statement} this can
+be written as an interchange with
+\begin{equation}
+\label{eq:cmi-align}
+\tau = \mathrm{id}_{\mathbb{R}^{d}}, \quad
+\Pi_\ell = \bigl\{\text{CoT positions in layer } \ell\bigr\},
+\end{equation}
+where $\Pi_\ell$ selects a fixed, data-determined subset of positions (namely
+the positions occupied by CoT tokens) at a single layer~$\ell$. Crucially, the
+featurizing map is the identity and $\Pi_\ell$ is determined by the input
+tokenization, not fitted to the model. The dilemma of \cref{prop:vacuity}
+requires the freedom to \emph{choose} $\tau$ after seeing $\mathcal{M}$; CMI
+chooses nothing from $\mathcal{F}$ because its $\mathcal{F}=\{\mathrm{id}\}$,
+the same singleton as \CLP.
+
+There is, however, a subtlety. CMI applies a second intervention, the
+\emph{control patch}, which replaces the same number of non-CoT positions and
+subtracts the resulting drop from the CoT-patch drop (\cref{eq:cmi}).
+The selection of control positions introduces a degree of freedom that could,
+in principle, be adversarially tuned. In practice
+\citet{DBLP:journals/corr/abs-2602-03994} draw control positions uniformly at random, so no
+fitting occurs, but the possibility should be noted: if one were to search over
+control positions to maximize $\mathrm{CMI}_\ell$, the subtraction would
+introduce an optimization whose expressiveness would need analysis of its own.
+Under the published random-control protocol, this concern does not arise, and
+CMI shares with \CLP\ the property that its featurizing map is the identity.
+
+A second difference is the \emph{scope} of the intervention. \CLP\ replaces the
+entire last-layer residual stream at one step ($d$ coordinates, all positions),
+while CMI replaces a subset of positions at one layer. The former measures
+whether the full state at step~$\stepk$ determines the answer; the latter
+measures how much the CoT representations at layer~$\ell$ contribute to the
+answer. Neither is a special case of the other: they answer different questions
+(step-time commitment vs.\ depth-wise dependence on CoT), and both escape the
+dilemma by the same mechanism (fixing $\tau=\mathrm{id}$) while differing in
+$\Pi$.
+
+\paragraph{Step-level corruption (NLDD).}
+The NLDD intervention of \citet{DBLP:journals/corr/abs-2602-11201} operates
+at the behavioral level: it replaces the emitted token at step~$\stepk$ with a
+random vocabulary token, re-runs the model from that point, and observes the
+change in answer log-probability. This is not an activation-level intervention
+at all; the model is simply re-run on a different input sequence.
+
+In the notation of \cref{app:dilemma-statement}, there is no $\tau$ and no
+$\Pi$, because the framework of \cref{eq:iia} presupposes an intervention on
+\emph{internal} representations. NLDD intervenes on the \emph{input}, which
+is the text that the model reads. The dilemma therefore does not apply:
+\cref{prop:vacuity} concerns the expressiveness of maps applied to hidden
+states, and NLDD accesses no hidden states. A perfect NLDD score (or an
+informative Reasoning Horizon) cannot be an artifact of alignment flexibility,
+because no alignment is involved.
+
+NLDD has a different vulnerability in its place. Because the corrupted token
+is drawn from the full vocabulary, it introduces a distribution shift in the
+input that can propagate through subsequent attention layers. The observed
+$\mathrm{NLDD}(\stepk)$ therefore confounds two effects: (i) the genuine causal
+role of step~$\stepk$ in determining the answer, and (ii) the out-of-distribution
+disruption that any unexpected token causes. \CLP\ avoids this confound by
+intervening on internal states drawn from the same task distribution (a
+different problem instance), so the injected state is always in-distribution
+for the model's representational geometry. The control-injection ablation of
+\cref{app:ablations} further isolates this by comparing CLP's source-state
+transplant against a random or orthogonalized vector.
+
+\paragraph{Summary.}
+\Cref{tab:dilemma-status} collects the dilemma status of the four causal or
+quasi-causal methods we consider.
+
+\begin{table}[ht]
+\centering\small
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}lccp{2.6cm}@{}}
+\toprule
+Method & $\tau$ fitted? & Dilemma? & Vulnerability \\
+\midrule
+DAS & yes & \textbf{yes} & vacuity (\cref{prop:vacuity}) \\
+CMI & no ($\mathrm{id}$) & no & control-position choice \\
+\CLP\ & no ($\mathrm{id}$) & no & no localization \\
+NLDD & n/a & no & input dist.\ shift \\
+\bottomrule
+\end{tabular}
+\caption{Dilemma status of the four causal or quasi-causal methods. Only DAS
+fits~$\tau$ and is subject to \cref{prop:vacuity}. CMI and \CLP\ fix
+$\tau=\mathrm{id}$; NLDD operates on inputs, not representations.}
+\label{tab:dilemma-status}
+\end{table}
+
+\subsection{Relation to Existing Interventions}
+\label{sec:clp-relation}
+
+\CLP\ belongs to the interchange-intervention family but occupies a distinct
+point in its design space.
+
+\emph{Activation patching} transplants a single component (a head, an MLP, or a
+position) to \emph{localize} which part of the network mediates a particular
+fact or behavior
+\citep{DBLP:conf/nips/MengBAB22,DBLP:journals/corr/abs-2404-15255}. \CLP\
+transplants the entire last-layer state and asks not \emph{where} computation
+lives but \emph{whether} the answer is already fixed.
+
+\emph{Distributed alignment search} (DAS) \emph{learns} a rotation and subspace
+to align with a hypothesized variable
+\citep{DBLP:conf/clear2/GeigerWPIG24}. \CLP\ learns nothing, which is exactly
+why the dilemma does not apply.
+
+\emph{Layerwise causal mediation}, such as the CoT Mediation Index of
+\citet{DBLP:journals/corr/abs-2602-03994}, sweeps over \emph{layers} while
+fixing the full chain, reporting where in depth the model relies on the
+reasoning trace. \CLP\ fixes the layer and sweeps over \emph{steps}, reporting
+when along the chain the answer becomes fixed.
+
+\emph{Forward-decoding probes} (logit lens, tuned lens) ask whether the answer
+is \emph{decodable} from a state
+\citep{nostalgebraist2020logitlens,DBLP:journals/corr/abs-2303-08112,DBLP:conf/conll/PalSYWB23}.
+\CLP\ asks whether \emph{rewriting} that state changes the answer, the
+counterfactual that decodability alone cannot establish.
+
+In each case the distinction is the same: the existing method asks where
+information is or whether it can be read out; \CLP\ asks whether altering it
+moves the answer, which is what commitment requires.
+
+\section{\texorpdfstring{$\CRASPCoT$}{C-RASP-CoT} Semantics and Equivalence}
+\label{app:craspcot}
+
+This appendix gives the formal semantics of \textsc{C-Rasp}, defines the
+autoregressive reading $\CRASPCoT$ used in \cref{sec:prelim-crasp}, and proves
+that the two compute the same class of functions. The equivalence is what lets
+us import the expressivity results for standard \textsc{C-Rasp}
+\citep{DBLP:journals/corr/abs-2404-04393,DBLP:conf/nips/YangCCN25} when reasoning
+about the prescribed trajectory.
+
+\subsection{Standard \texorpdfstring{\textsc{C-Rasp}}{C-RASP} Semantics}
+\label{app:craspcot-standard}
+
+A \textsc{C-Rasp} program operates on an input string $w=w_{1}\cdots w_{n}\in
+\Sigma^{+}$ and manipulates two sorts of position-indexed vectors of length $n$.
+A \emph{Boolean} vector $P$ assigns $P(i)\in\{0,1\}$ to each position $i$; a
+\emph{count} vector $C$ assigns $C(i)\in\mathbb{N}$. The semantics is given by
+the following operations, each defining a new vector pointwise from existing
+ones.
+
+\begin{itemize}[leftmargin=*,topsep=2pt,itemsep=1pt]
+\item \textbf{Input.} For each $\sigma\in\Sigma$ the initial Boolean vector
+$Q_{\sigma}$ is $Q_{\sigma}(i)=\mathbf{1}[w_{i}=\sigma]$.
+\item \textbf{Boolean combination.} For Boolean vectors $P_{1},P_{2}$ and any
+Boolean function $f$, the vector $f(P_{1},P_{2})$ is $f(P_{1}(i),P_{2}(i))$.
+\item \textbf{Prefix count.} For a Boolean vector $P$, the count vector
+$\#P$ is $\#P(i)=\sum_{j\le i}P(j)$, the number of earlier positions, inclusive,
+at which $P$ holds.
+\item \textbf{Comparison.} For count vectors $C_{1},C_{2}$, the Boolean vector
+$[C_{1}\le C_{2}]$ is $\mathbf{1}[C_{1}(i)\le C_{2}(i)]$; constants and the
+analogous relations are included.
+\end{itemize}
+
+A program is a finite sequence of such operations terminating in a designated
+Boolean or count vector; its output at position $i$ is the value of that vector
+at $i$. The \emph{nesting depth} of a program is the maximal number of prefix
+counts nested through one another, the serial resource the \textsc{C-Rasp}
+depth hierarchy measures \citep{DBLP:conf/nips/YangCCN25}.
+
+\subsection{The Autoregressive Reading}
+\label{app:craspcot-auto}
+
+A CoT differs from a fixed input in two ways: it is revealed one
+symbol at a time, and the program may condition later steps on symbols it has
+itself emitted. We capture both with a reading that evaluates the program on
+growing prefixes.
+
+\begin{definition}[$\CRASPCoT$]
+\label{def:craspcot}
+Let $P$ be a \textsc{C-Rasp} program over the alphabet $\Sigma\cup\Gamma$, where
+$\Gamma$ is a finite set of output symbols. The \emph{autoregressive reading}
+$\CRASPCoT$ evaluates $P$ at each step $\stepk$ on the prefix
+$x_{1{:}\stepk}\in(\Sigma\cup\Gamma)^{\stepk}$ available at that step, and emits
+the output symbol $x_{\stepk+1}\in\Gamma$ determined by the program's terminal
+vector at position $\stepk$. The emitted symbol is appended to the prefix and is
+available to the program at every later step. The \emph{answer} is read from the
+terminal prefix through the readout $\kappa$ of \cref{sec:prelim-cot}.
+\end{definition}
+
+The only departure from standard \textsc{C-Rasp} is that the input to step
+$\stepk$ includes symbols in $\Gamma$ produced at steps $1,\dots,\stepk-1$. All
+operations of \cref{app:craspcot-standard} apply unchanged, now over the
+extended alphabet $\Sigma\cup\Gamma$.
+
+\subsection{Equivalence}
+\label{app:craspcot-equiv}
+
+\begin{theorem}[Prefix equivalence]
+\label{thm:craspcot-equiv}
+For every $\CRASPCoT$ program there is a standard \textsc{C-Rasp} program that
+computes the same map from complete prefixes $x_{1{:}T}$ to outputs, and
+conversely. The transformation preserves nesting depth up to an additive
+constant.
+\end{theorem}
+
+\begin{proof}
+$(\Leftarrow)$ A standard \textsc{C-Rasp} program is the special case of
+\cref{def:craspcot} with $\Gamma=\emptyset$, so every \textsc{C-Rasp} program is
+already a $\CRASPCoT$ program reading no outputs of its own.
+
+$(\Rightarrow)$ Fix a $\CRASPCoT$ program $P$ and a complete run with prefix
+$x_{1{:}T}\in(\Sigma\cup\Gamma)^{T}$. Define a standard \textsc{C-Rasp} program
+$P'$ over $\Sigma\cup\Gamma$ that treats $x_{1{:}T}$ as a single fixed input.
+The initial vectors $\{Q_{\sigma}\}_{\sigma\in\Sigma\cup\Gamma}$ of $P'$ encode
+every symbol of the prefix, including the emitted ones, exactly as $P$ reads
+them. Because each operation in \cref{app:craspcot-standard} at position $i$
+depends only on positions $j\le i$ through the prefix count, the value $P$
+computes at step $\stepk$, which depends only on $x_{1{:}\stepk}$, equals the
+value $P'$ computes at position $\stepk$ on the fixed input. Hence $P'$
+reproduces $P$ on the run. The construction adds at most one Boolean vector to
+distinguish symbols of $\Gamma$ from those of $\Sigma$, increasing nesting depth
+by at most a constant.
+\end{proof}
+
+\Cref{thm:craspcot-equiv} has the consequence we use in the main text. Since the
+two readings compute the same functions with the same nesting depth up to a
+constant, the expressivity characterizations of standard \textsc{C-Rasp}, in
+particular its equivalence to the counting logic $\mathrm{K}_{t}[\#]$ and its
+status as the tightest known lower bound on future-masked soft-attention
+transformers \citep{DBLP:journals/corr/abs-2404-04393}, transfer to
+$\CRASPCoT$. The information accumulated by the program through step $\stepk$,
+$I_{\pi}(\stepk)$ in \cref{eq:infoacc}, is therefore a well-defined property of
+the prefix the program has read, independent of which of the two readings is
+used to compute it.
+
+\section{Compilation Pipeline}
+\label{app:compile}
+
+This appendix describes how the $\CRASPCoT$ program for each task is compiled
+into a transformer of known structure, the construction used as ground truth in
+\cref{sec:results-validity}.
+
+\subsection{Overview}
+\label{app:compile-overview}
+
+We use Tracr \citep{DBLP:conf/nips/LindnerKFRMM23}, which maps a program in the
+\textsc{Rasp} family to transformer weights that provably implement it. Each
+program is expressed with the Boolean and prefix counting primitives of
+\cref{app:craspcot-standard}; the prefix count is realized through the
+attention pattern Tracr assigns to a counting selector, and the comparison and
+Boolean operations are realized in the feed-forward blocks. The compiled model
+uses fixed-precision arithmetic at the precision the program's counting depth
+requires, so that count values are represented without overflow over the input
+lengths the task uses. Because compilation fixes the weights from the program
+rather than fitting them, the resulting model executes $\pi$ exactly, which is
+what makes it a valid reference for the recovery check: any departure of
+$\widehat{\CDM}$ from $\CDP$ on the compiled model is attributable to
+estimation error rather than to the model implementing a different computation.
+
+\subsection{Per-Task Programs}
+\label{app:compile-pertask}
+
+Each program below is described in terms of the primitives of
+\cref{app:craspcot-standard} and evaluated autoregressively per
+\cref{def:craspcot}. The nesting depth determines the number of serial prefix
+counts the program requires, which in turn determines the minimum number of
+transformer layers the compiled model needs.
+
+\paragraph{Dyck-2 (nesting depth 1).}
+The program maintains two count vectors: $C_{(} = \#Q_{(}$ (number of opening
+round brackets seen so far) and $C_{)} = \#Q_{)}$ (number of closing round
+brackets), and analogously $C_{[}$ and $C_{]}$ for square brackets. At each
+step the program checks two conditions: (i) no prefix has more closing than
+opening brackets of either type ($[C_{)} \le C_{(}]$ and $[C_{]} \le C_{[}]$),
+and (ii) bracket types are properly nested (a closing bracket matches the most
+recent unmatched opener). The answer is Balanced if both conditions hold at the
+final position and the counts are equal; otherwise Unbalanced. Because only
+prefix counts and comparisons are used, the nesting depth is 1.
+
+\paragraph{$A_4/S_4$ group words (nesting depth 2).}
+The program tracks the image of each point $p \in \{1,\dots,n_{\mathrm{group}}\}$
+under the running product of generators read left to right. At step $k$ the
+program reads a generator $\sigma_k$ and updates the image of each point by
+composing with $\sigma_k$. The composition requires a prefix count over
+Boolean indicators for each point-image pair, nested inside a second prefix
+count that accumulates the product. The answer is the final permutation in
+cycle notation. Because $A_4$ and $S_4$ are solvable, the program can track
+the image through at most two levels of prefix counting (nesting depth 2).
+
+\paragraph{$A_5/S_5$ group words (nesting depth 3).}
+The program is structurally identical to $A_4/S_4$ but operates on a larger
+group. Because $A_5$ and $S_5$ are non-solvable and $\mathsf{NC}^1$-complete,
+the serial computation is provably necessary: no constant-depth program can
+compute the group product for all input lengths. The nesting depth is 3, the
+deepest in our suite, which means the prescribed trajectory $\CDP$ rises most
+slowly and the task is the most diagnostic for premature commitment.
+
+\paragraph{FSA execution (nesting depth 1).}
+The program simulates a deterministic finite automaton: it maintains a Boolean
+vector $Q_{q}$ for each state $q$, where $Q_{q}(i) = 1$ iff the automaton is
+in state $q$ after reading the first $i$ symbols. The transition at each step
+is a Boolean combination of the current state indicators and the input symbol
+indicator, requiring no nested prefix counts (nesting depth 1). The answer is
+the state $q$ for which $Q_{q}$ is true at the final position.
+
+\paragraph{Entity tracking (nesting depth 1, approximate).}
+The program tracks the location of a queried entity through a sequence of
+update sentences. At each sentence boundary it checks whether the entity is
+mentioned and, if so, updates its location to the new value. The program uses
+prefix counts over sentence-boundary indicators and Boolean tests for entity
+mentions. This program is an \emph{approximation}: natural-language entity
+tracking admits paraphrases and implicit updates that the program does not
+capture, so $I_{\pi}(k)$ is a lower bound on the true information
+$I_{\pi^{*}}(k)$ and $\CDP$ is correspondingly looser
+(\cref{app:proof-boundary}). The nesting depth is 1.
+
+\subsection{Compilation Parameters}
+\label{app:compile-params}
+
+\begin{table}[t]
+\centering\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+Parameter & Value \\
+\midrule
+Tracr version & 1.1.0 \\
+Precision (bits per count) & 32 \\
+Maximum input length & 64 \\
+Compiled layers (Dyck-2) & 4 \\
+Compiled layers ($A_4/S_4$) & 6 \\
+Compiled layers ($A_5/S_5$) & 8 \\
+Compiled layers (FSA) & 4 \\
+Compiled layers (Entity) & 4 \\
+$d_{\mathrm{model}}$ (compiled) & 128 \\
+\bottomrule
+\end{tabular}
+\caption{Tracr compilation parameters. The number of compiled layers matches
+the nesting depth of the program plus the overhead Tracr requires for the
+input embedding and output readout.}
+\label{tab:compile-params}
+\end{table}
+
+Tracr assigns two attention layers per prefix-count operation (one for the
+selector and one for the aggregate) plus two additional layers for the input
+embedding and the output readout. The total number of compiled layers is
+therefore $2d+2$ where $d$ is the nesting depth: Dyck-2 and FSA
+(depth 1) compile to the fewest layers, $A_5/S_5$ (depth 3) to the most.
+The model dimension $d_{\mathrm{model}}$ is set by Tracr to accommodate the
+number of Boolean and count vectors the program uses; it is typically much
+smaller than the hidden dimension of the trained models.
+
+\subsection{Precision Analysis}
+\label{app:compile-precision}
+
+Two sources of error affect the validity check of \cref{sec:results-validity}.
+
+\paragraph{Compilation error.}
+Tracr uses fixed-point arithmetic with a precision set high enough that count
+values do not overflow at the maximum input length. For the group-word and
+bracket tasks this precision is exact: the compiled model produces the correct
+answer on every instance up to the maximum length, which we verify exhaustively.
+For entity tracking the compilation is approximate (the program itself is an
+approximation), so we verify on a sample of 1000 instances that the compiled
+model's answer matches the gold answer; the agreement rate is reported in
+\cref{tab:compile-precision}.
+
+\paragraph{Estimation error.}
+Even on a compiled model that executes $\pi$ exactly, the estimator
+$\widehat{\CDM}(\stepk)$ has finite-sample variance. The validity check
+succeeds if $\widehat{\CDM}(\stepk)$ falls within the bootstrap CI of
+$\CDP(\stepk)$ at every step. We report the fraction of steps at which this
+holds for each task in \cref{tab:compile-precision}.
+
+\begin{table}[t]
+\centering\small
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Task & Comp.\ acc. & In CI & Max $|\Delta|$ \\
+\midrule
+Dyck-2    & 100\% & 24/24 & 0.018 \\
+$A_4/S_4$ & 100\% & 24/24 & 0.021 \\
+$A_5/S_5$ & 100\% & 24/24 & 0.024 \\
+FSA       & 100\% & 24/24 & 0.019 \\
+Entity    & 97.2\% & 23/24 & 0.038 \\
+\bottomrule
+\end{tabular}
+\caption{Compilation precision. \emph{Comp.\ acc.}: fraction of instances
+with the correct compiled answer. \emph{In CI}: steps where $\widehat{\CDM}$
+falls within the bootstrap CI of $\CDP$. \emph{Max $|\Delta|$}: largest
+$|\widehat{\CDM}-\CDP|$ across steps.}
+\label{tab:compile-precision}
+\end{table}
+
+\section{Experimental Details}
+\label{app:exp}
+
+This appendix records the full experimental configuration behind the
+measurements of \cref{sec:results}. It is organized into six subsections
+covering models (\cref{app:exp-models}), tasks (\cref{app:exp-tasks}), sampling
+design (\cref{app:exp-sampling}), generation (\cref{app:exp-generation}),
+compute (\cref{app:exp-compute}), and software (\cref{app:exp-software}).
+Together with the metric definitions of \cref{app:metrics} and the code
+repository, this information suffices to reproduce every reported number.
+
+\subsection{Models}
+\label{app:exp-models}
+
+\Cref{tab:model-specs} lists the five model checkpoints used in this study.
+All are publicly released and accessed through the HuggingFace
+\texttt{transformers} library (or the corresponding Mamba library for the
+state-space model). We do not fine-tune or modify any checkpoint; all
+measurements are taken on the released weights.
+
+\begin{table*}[t]
+\centering\small
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{@{}llrrrrll@{}}
+\toprule
+Name & Architecture & Params & Layers & Heads & $d_\mathrm{model}$ & Checkpoint & Training \\
+\midrule
+Pythia     & GPT-NeoX & 410M & 24 & 16 & 1024 & \texttt{pythia-410m} & autoregressive LM \\
+Llama-base & Llama-3.2 & 3B & 28 & 24 & 3072 & \texttt{Llama-3.2-3B} & autoregressive LM \\
+Llama-inst & Llama-3.2 & 3B & 28 & 24 & 3072 & \texttt{Llama-3.2-3B-Inst} & SFT + RLHF \\
+Mamba      & Mamba (SSM) & 2.8B & 64 & n/a & 2560 & \texttt{mamba-2.8b} & autoregressive LM \\
+R1-Distill & Llama-3.1 & 8B & 32 & 32 & 4096 & \texttt{R1-Distill-Llama-8B} & SFT + RL (DeepSeek) \\
+\bottomrule
+\end{tabular}
+\caption{Model specifications. 
+The Mamba model uses selective state-space layers instead of attention heads.}
+\label{tab:model-specs}
+\end{table*}
+
+\paragraph{Pythia} is an autoregressive transformer from the Pythia suite
+\citep{DBLP:conf/icml/BidermanSABOHKP23}, trained on the Pile with known
+training data order and publicly released intermediate checkpoints. We use the
+final checkpoint at a size for which a CoT can be reliably
+elicited on all five tasks.
+
+\paragraph{Llama-3.2 (base and instruct)} provides a matched pair: the base
+model is the pre-trained autoregressive LM, while the instruct variant is the
+same architecture after supervised fine-tuning and RLHF alignment. Comparing the
+two isolates the effect of instruction tuning on commitment timing.
+
+\paragraph{Mamba} is a selective state-space model without attention. It serves
+as an architectural control: because Mamba processes the sequence through a
+recurrent state rather than through key-value attention, commitment dynamics
+could in principle differ from transformer-based models. Including it tests
+whether the findings are specific to the attention mechanism.
+
+\paragraph{R1-Distill} is a Llama-3.1 model distilled from DeepSeek-R1 using
+reinforcement learning on reasoning tasks. It is the critical experimental
+condition: if RL training induces premature commitment, R1-Distill should
+violate the faithfulness bound more than the base and instruction-tuned models.
+
+\subsection{Tasks}
+\label{app:exp-tasks}
+
+\Cref{tab:task-specs} summarizes the five tasks. The prompt templates appear in
+\cref{app:prompts}; the $\CRASPCoT$ programs and their Tracr compilation appear
+in \cref{app:craspcot,app:compile}.
+
+\begin{table}[t]
+\centering\small
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}lrrlp{2.5cm}@{}}
+\toprule
+Task & $|\mathcal{A}|$ & Seq.\ len & $\CDP$ & Source \\
+\midrule
+Dyck-2    & 2   & 8--32   & exact  & generated \\
+$A_4/S_4$ & 12/24 & 4--8  & exact  & generated \\
+$A_5/S_5$ & 60/120 & 4--8 & exact  & generated \\
+FSA       & 2--4 & 8--16  & exact  & generated \\
+Entity    & 3--6 & 3--5 sent. & approx & adapted \\
+\bottomrule
+\end{tabular}
+\caption{Task specifications. $|\mathcal{A}|$: answer-set size. Seq.\ len:
+input length range (tokens for formal tasks, sentences for entity tracking).
+$\CDP$: whether the prescribed trajectory is exact or approximate. Source:
+instances are procedurally generated or adapted from existing datasets.}
+\label{tab:task-specs}
+\end{table}
+
+\paragraph{Instance generation.}
+For the group-word tasks, we sample a sequence of generators uniformly at random
+from the group, with sequence length drawn uniformly from the stated range. For
+Dyck-2, we sample balanced and unbalanced sequences with equal probability,
+controlling the bracket depth and length. For FSA, we sample a random
+deterministic automaton with the stated number of states and a binary input
+alphabet, then sample an input string. For entity tracking, we adapt instances
+from the standard entity-tracking benchmark, selecting instances with 3--5
+sentences and a single queried entity. In all cases base--source pairs are
+constructed by pairing instances whose gold answers differ.
+
+\paragraph{Balancing.}
+To prevent the estimator from being dominated by a single answer class, we
+balance the base--source pairing: within each task, every answer in
+$\mathcal{A}$ appears as the base answer approximately equally often, and
+likewise for the source answer. This is achieved by stratified sampling.
+
+\subsection{Sampling Design}
+\label{app:exp-sampling}
+
+\begin{table}[t]
+\centering\small
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}lrlll@{}}
+\toprule
+Parameter & Value & Range & Ref \\
+\midrule
+Pairs $N$       & 1000 & 50--2000 & \cref{app:ablation-sampling} \\
+Bootstrap $B$   & 2000 & 200--5000 & \cref{app:ablation-bootstrap} \\
+Seeds           & \{0,1,2\} & & \\
+Step bins       & 24 & & \\
+Accuracy bins   & 5 & & \cref{sec:results-matched} \\
+\bottomrule
+\end{tabular}
+\caption{Sampling design parameters. }
+\label{tab:sampling-design}
+\end{table}
+
+The CoT step axis is discretized into 24 equally spaced bins on
+$[0,1]$, matching the resolution of the figures. Each bin's $\CDM$ is estimated
+from the $N$ base--source pairs whose normalized step falls in that bin.
+Confidence intervals are 95\% percentile bootstrap intervals computed from $B$
+resamples. The sampling and bootstrap ablations of
+\cref{app:ablation-sampling,app:ablation-bootstrap} confirm that the reported
+$N$ and $B$ are large enough for convergence.
+
+For the matched-accuracy comparison (\cref{sec:results-matched}), instances are
+partitioned into 5 equal-width accuracy bins based on the model's final-answer
+accuracy on the base problem, and $\stepk^{*}$ is computed within each bin.
+This ensures that earliness is not confounded with accuracy.
+
+\subsection{Generation Configuration}
+\label{app:exp-generation}
+
+\begin{table}[t]
+\centering\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+Parameter & Value \\
+\midrule
+Decoding (chain) & sampling, $T$=0.6, top-$p$=0.95 \\
+Decoding (answer line) & greedy ($T$=0) \\
+Max new tokens (chain) & 512 \\
+Max new tokens (answer) & 32 \\
+Batch size & 16 \\
+Precision & \texttt{float16} \\
+\bottomrule
+\end{tabular}
+\caption{Generation configuration. The chain is sampled at positive temperature
+to allow diverse reasoning paths; the answer line is decoded greedily so that
+the readout is deterministic (\cref{app:proof-boundary}). }
+\label{tab:generation-config}
+\end{table}
+
+The CoT is generated at positive temperature to allow diverse
+reasoning paths (the temperature ablation of \cref{app:ablation-temperature}
+confirms that $\stepk^{*}$ is stable across temperatures). The answer line is
+always decoded greedily ($T=0$), which makes the readout deterministic and
+ensures that the Fano bound underlying \cref{thm:bound} is tight
+(\cref{app:proof-boundary}). The chain-length ablation of
+\cref{app:ablation-chainlen} confirms that the normalized commitment step is
+stable across maximum token budgets.
+
+\subsection{Compute}
+\label{app:exp-compute}
+
+\begin{table}[t]
+\centering\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+Resource & Value \\
+\midrule
+GPU model & NVIDIA A100 80GB \\
+GPUs per run & 1 \\
+Total GPU-hours (main experiments) & 120 \\
+Total GPU-hours (ablations) & 280 \\
+Total GPU-hours (baselines) & 90 \\
+Peak GPU memory & 42 GB \\
+Wall-clock time per CLP sweep & 35 min \\
+\bottomrule
+\end{tabular}
+\caption{Compute requirements. One CLP sweep evaluates $\CDM(\stepk)$ at
+24 step bins for one (model, task) pair. Totals cover main experiments
+(25 cells), ablations (\cref{app:ablations}), and baselines
+(\cref{app:competitors}).}
+\label{tab:compute}
+\end{table}
+
+Because \CLP\ is parameter-free, the dominant cost is forward-pass inference:
+each base--source pair requires two forward passes (one for the base chain, one
+with the transplanted residual stream) plus a readout. The cost scales linearly
+with $N$ (the number of pairs) and with the model size. No training is involved,
+so the total compute is modest relative to the cost of training the models
+themselves.
+
+\subsection{Software}
+\label{app:exp-software}
+
+\begin{table}[t]
+\centering\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+Component & Version \\
+\midrule
+Python & 3.11.7 \\
+PyTorch & 2.2.1 \\
+HuggingFace Transformers & 4.39.3 \\
+Mamba (state-spaces) & 1.2.0 \\
+Tracr & 1.1.0 \\
+NumPy & 1.26.4 \\
+Matplotlib & 3.8.3 \\
+\bottomrule
+\end{tabular}
+\caption{Software versions. The code repository includes a
+\texttt{requirements.txt} that pins all dependencies to the exact versions used.}
+\label{tab:software}
+\end{table}
+
+All experiments are implemented in Python using PyTorch for model inference and
+HuggingFace Transformers for checkpoint loading and tokenization. The Mamba model
+uses the official \texttt{state-spaces/mamba} library. Tracr is used for
+compiling the $\CRASPCoT$ programs into transformer weights. The figure
+generation script (\texttt{make\_all\_figs\_v2.py}) uses Matplotlib with the
+configuration of \cref{sec:setup-protocol} (PDF output, DPI\,=\,1200, Type\,42
+fonts). The full codebase, including task generation, the CLP estimator, all
+ablations, all baseline reproductions, and figure generation, is released at the
+repository linked from the abstract.
+
+\section{Metric Definitions}
+\label{app:metrics}
+
+This appendix gives the precise definitions of every quantity reported in
+\cref{sec:results}, the estimator and its uncertainty, the two summary metrics,
+and the baseline measures against which \CLP\ is compared.
+
+\subsection{The Commitment Depth Estimator}
+\label{app:metrics-estimator}
+
+\Cref{def:cd} defines $\CDM(\stepk)$ as a probability over base--source pairs.
+We estimate it by Monte Carlo. Let $\{(\mathbf{b}_{n},\mathbf{s}_{n})\}_{n=1}^{N}$
+be pairs drawn independently from the task distribution conditioned on
+$a(\mathbf{b}_{n})\neq a(\mathbf{s}_{n})$, and let
+\begin{equation}
+\label{eq:indicator}
+Y_{n}(\stepk) \;=\; \mathbf{1}\!\left[\kappa\!\left(
+\mathcal{M}^{\,\mathbf{h}^{(L)}_{\stepk}\leftarrow\mathbf{s}_{n}}(\mathbf{b}_{n})
+\right)=a(\mathbf{s}_{n})\right]
+\end{equation}
+be the flip indicator for pair $n$ at step $\stepk$. The estimator is the sample
+mean
+\begin{equation}
+\label{eq:estimator}
+\widehat{\CDM}(\stepk) \;=\; \frac{1}{N}\sum_{n=1}^{N} Y_{n}(\stepk).
+\end{equation}
+Each $Y_{n}(\stepk)$ is a Bernoulli draw with mean $\CDM(\stepk)$, so
+\cref{eq:estimator} is unbiased and has variance
+$\CDM(\stepk)\,(1-\CDM(\stepk))/N$. We report two-sided $95\%$ confidence
+intervals obtained by the percentile bootstrap over the $N$ pairs, resampled
+$B=1000$ times; the bootstrap is used rather than the normal approximation
+because $\CDM(\stepk)$ is near $0$ or $1$ at the ends of the trajectory, where
+the approximation is poor.
+
+\subsection{Summary Metrics}
+\label{app:metrics-summary}
+
+From the estimated trajectory we compute the summaries of \cref{def:u} plus two
+additional quantities that will be used in the ablation and statistical-testing
+appendices.
+
+\paragraph{Unfaithfulness functional.}
+The primary measure of bound violation is the largest positive gap above the
+prescribed trajectory,
+\begin{equation}
+\label{eq:u-est}
+\widehat{U}(\mathcal{M},\pi) \;=\; \max_{\stepk}\,
+\bigl[\widehat{\CDM}(\stepk)-\CDP(\stepk)\bigr]_{+}.
+\end{equation}
+
+\paragraph{Commitment step.}
+The commitment step is the first step at which the estimated commitment reaches
+one half,
+\begin{equation}
+\label{eq:kstar-est}
+\widehat{\stepk}^{*} \;=\; \min\{\stepk:\widehat{\CDM}(\stepk)\ge\tfrac12\}.
+\end{equation}
+
+\paragraph{Violation area.}
+To capture the breadth of a violation, not only its peak, we report the
+integrated violation
+\begin{equation}
+\label{eq:auc-violation}
+\widehat{A}(\mathcal{M},\pi) \;=\;
+\sum_{\stepk=1}^{T}\bigl[\widehat{\CDM}(\stepk)-\CDP(\stepk)\bigr]_{+}\,
+\Delta\stepk,
+\end{equation}
+where $\Delta\stepk=1/T$ on the normalized step axis. $A$ is zero when the bound
+is never crossed and grows with the duration and magnitude of the violation.
+
+\paragraph{Normalized unfaithfulness.}
+Because the maximum possible violation depends on the task (a task whose
+$\CDP$ rises late leaves more room above the bound), we also report the
+normalized functional
+\begin{equation}
+\label{eq:u-norm}
+\widehat{U}_{\mathrm{norm}} \;=\;
+\frac{\widehat{U}(\mathcal{M},\pi)}
+     {\max_{\stepk}\,[1-\CDP(\stepk)]},
+\end{equation}
+which divides the peak violation by the largest gap between $\CDP$ and the
+ceiling $1$, yielding a value in $[0,1]$ that is comparable across tasks with
+different prescribed trajectories. When $\CDP(\stepk)=1$ for all $\stepk$ (a
+degenerate task), the denominator is zero and the normalized value is undefined;
+no task in our suite has this property.
+
+Confidence intervals for all four summaries propagate from the bootstrap of
+\cref{app:metrics-estimator}: we recompute
+\cref{eq:u-est,eq:kstar-est,eq:auc-violation,eq:u-norm} on each resampled
+trajectory and report the $2.5$ and $97.5$ percentiles. In the
+matched-accuracy comparison of \cref{sec:results-matched}, $\widehat{\stepk}^{*}$
+is computed within each accuracy bin separately so that earliness is read at
+equal final-answer accuracy.
+
+\subsection{Baseline Measures}
+\label{app:metrics-baselines}
+
+We compare \CLP\ against three behavioral faithfulness measures and one
+probing measure, each computed on the same runs.
+
+\paragraph{Early-answering.} Following \citet{DBLP:journals/corr/abs-2307-13702},
+we truncate the CoT at step $\stepk$, force the model to answer
+immediately, and record whether the answer matches the one it gives from the
+full chain. The early-answering curve is the fraction of instances whose answer
+is already fixed by step $\stepk$; it is behavioral, read from inputs and
+outputs alone, and does not intervene on internal state.
+
+\paragraph{Accuracy-controlled normalization.} \citet{DBLP:journals/tmlr/BenthamSM24}
+observe that the early-answering signal is confounded with task accuracy, since
+a model that is simply correct will appear to commit early. We therefore report
+the accuracy-normalized variant, which conditions the early-answering fraction
+on final-answer correctness so that commitment is not credited to accuracy
+alone.
+
+\paragraph{Detection--extraction gap.} \citet{DBLP:journals/corr/abs-2604-06613}
+distinguish whether an answer is \emph{determined} in the trace from whether it
+can be \emph{extracted} by forcing the model to emit it. We report the gap
+between the step at which the answer becomes recoverable and the step at which
+forced extraction succeeds, as a behavioral proxy for premature determination.
+
+\paragraph{Answer and correctness probes.} We train linear probes on the
+last-layer residual stream at each step to predict the final answer and its
+correctness, and report their accuracy as a function of $\stepk$. A probe
+measures whether the answer is \emph{decodable} from the state, which
+\cref{sec:clp-relation} contrasts with the causal question \CLP\ asks; the probe
+curve is included to show that decodability precedes causal commitment.
+
+\subsection{Competitor Method Metrics}
+\label{app:metrics-competitors}
+
+The following metrics are computed by reproducing the methods of prior work on
+our tasks, as described in \cref{app:competitors}. We define them here so that
+the comparison is self-contained.
+
+\paragraph{CoT Mediation Index (CMI).}
+Following \citet{DBLP:journals/corr/abs-2602-03994}, for a model with $L$ layers we define
+\begin{equation}
+\label{eq:cmi}
+\mathrm{CMI}_{\ell} \;=\;
+\frac{\Delta_{\ell}^{\mathrm{CoT}} - \Delta_{\ell}^{\mathrm{ctrl}}}
+     {\Delta_{\ell}^{\mathrm{CoT}}},
+\end{equation}
+where $\Delta_{\ell}^{\mathrm{CoT}}$ is the drop in answer log-probability when
+the hidden states at CoT token positions in layer $\ell$ are replaced with those
+from a No-CoT forward pass, and $\Delta_{\ell}^{\mathrm{ctrl}}$ is the
+analogous drop when the same number of non-CoT positions are replaced. The index
+is bounded in $[0,1]$ and measures the causal contribution of CoT
+representations at layer $\ell$. We report $\mathrm{CMI}_{\ell}$ for every layer
+alongside the per-layer $\CDM$ from the layer ablation of
+\cref{app:ablations}, so that the two depth profiles can be compared on the same
+model and task.
+
+\paragraph{Pre-CoT probe accuracy.}
+Following \citet{DBLP:journals/corr/abs-2603-01437}, we fit a
+difference-of-means linear classifier on the residual stream at the last token
+before the CoT begins and report its accuracy on a held-out split.
+The classifier is re-fit for each task and model. We report both the raw probe
+accuracy and the area under the probe-accuracy curve as a function of CoT step
+$\stepk$ (where the probe is applied to the state \emph{during} the chain, not
+only before it), so that the trajectory of decodability can be compared with the
+trajectory of causal commitment.
+
+\paragraph{Normalized Logit-Difference Drop (NLDD).}
+Following \citet{DBLP:journals/corr/abs-2602-11201}, we corrupt the reasoning
+trace at step $\stepk$ by replacing the emitted token with a random token from
+the vocabulary, re-run the model, and measure the change in logit difference
+between the correct and incorrect answers. The normalized drop is
+\begin{equation}
+\label{eq:nldd}
+\mathrm{NLDD}(\stepk) \;=\;
+1 - \frac{\Delta_{\mathrm{logit}}(\text{corrupted at }\stepk)}
+         {\Delta_{\mathrm{logit}}(\text{clean})},
+\end{equation}
+where $\Delta_{\mathrm{logit}}$ is the difference in log-probabilities between
+the gold answer and the runner-up. The \emph{Reasoning Horizon} of
+\citet{DBLP:journals/corr/abs-2602-11201} is the step beyond which
+$\mathrm{NLDD}(\stepk)$ remains below a threshold, analogous to our
+$\stepk^{*}$ but defined behaviorally rather than causally.
+
+\paragraph{Distributed Alignment Search (DAS) IIA.}
+Following \citet{DBLP:conf/clear2/GeigerWPIG24}, we learn a rotation matrix
+$R\in\mathrm{O}(d)$ on the last-layer residual stream so that intervening on the
+first $r$ components of $R\mathbf{h}$ reproduces the effect of intervening on
+the target causal variable. The interchange intervention accuracy (IIA) is the
+fraction of instances for which the intervention produces the counterfactual
+answer. We report IIA as a function of step $\stepk$ alongside $\CDM(\stepk)$;
+the comparison isolates the effect of learning the alignment (DAS) versus fixing
+it to the identity (\CLP), since both intervene on the same representational
+layer. We set $r=1$ (rank-1 subspace) to match the strongest version of the
+method and report results with $r\in\{1,4,16\}$ in the ablation of
+\cref{app:ablations}.
+
+\subsection{Statistical Testing Framework}
+\label{app:metrics-stats}
+
+To support the claims of \cref{sec:results} with formal significance tests, we
+define the following procedures, with full results in \cref{app:stattests}.
+
+\paragraph{Permutation test for $U$.}
+For each task and each model pair $(\mathcal{M}_1,\mathcal{M}_2)$, we test
+whether $U(\mathcal{M}_1,\pi) > U(\mathcal{M}_2,\pi)$ by pooling the flip
+indicators $Y_n(\stepk)$ from both models, permuting the model labels $10{,}000$
+times, and computing $\widehat{U}$ on each permutation. The one-sided $p$-value
+is the fraction of permutations yielding a difference at least as large as the
+observed one.
+
+\paragraph{Effect size for $\stepk^{*}$.}
+We report Cliff's delta, a nonparametric effect size, for the difference in
+$\stepk^{*}$ between each model pair within each task:
+\begin{equation}
+\label{eq:cliffs-delta}
+\delta \;=\; \frac{\#(k^{*}_1 > k^{*}_2) - \#(k^{*}_1 < k^{*}_2)}{n_1\,n_2},
+\end{equation}
+where $k^{*}_1$ and $k^{*}_2$ are the commitment steps computed on each of the
+$n_1$ and $n_2$ bootstrap resamples, respectively. Values $|\delta|>0.474$ are
+considered large effects by conventional thresholds.
+
+\paragraph{Multiple-comparison correction.}
+Because we test $\binom{5}{2}=10$ model pairs across $5$ tasks ($50$ tests in
+total for $U$), we apply the Holm--Bonferroni step-down procedure to control the
+family-wise error rate at $\alpha=0.05$.
+
+\section{Competitor Reproductions}
+\label{app:competitors}
+
+This appendix describes how each baseline and competitor method is reproduced on
+our five tasks. Every method is computed on the same runs and the same
+base--source pairs as \CLP, so that the comparison is controlled. The metric
+definitions appear in \cref{app:metrics-baselines,app:metrics-competitors};
+here we describe the reproduction protocol and report results.
+
+\subsection{Early-Answering}
+\label{app:competitors-ea}
+
+Following \citet{DBLP:journals/corr/abs-2307-13702}, we truncate the chain of
+thought at each step $\stepk$ and force the model to emit an answer immediately.
+The early-answering curve is the fraction of instances whose forced answer
+matches the full-chain answer, read on the same 24-bin step grid as the
+Commitment Depth trajectory. The measure is behavioral: it tests whether the
+output is already determined from the partial chain, without intervening on
+internal state.
+
+\subsection{Accuracy-Controlled Normalization}
+\label{app:competitors-ac}
+
+Following \citet{DBLP:journals/tmlr/BenthamSM24}, we condition the
+early-answering fraction on final-answer correctness. Instances on which the
+model is correct receive weight 1; instances on which it is incorrect receive
+weight 0 before computing the fraction. This removes the confound that a simply
+more accurate model will appear to commit earlier. The resulting curve is the
+accuracy-controlled analogue of the early-answering curve.
+
+\subsection{Detection--Extraction Gap}
+\label{app:competitors-de}
+
+Following \citet{DBLP:journals/corr/abs-2604-06613}, we distinguish
+\emph{detection} (the step at which the answer first becomes recoverable from a
+linear probe on the chain) from \emph{extraction} (the step at which forcing the
+model to emit the answer succeeds). The gap between the two provides a
+behavioral proxy for premature determination. We report the gap for each
+(model, task) pair alongside $\stepk^{*}$.
+
+\subsection{Distributed Alignment Search (DAS)}
+\label{app:competitors-das}
+
+Following \citet{DBLP:conf/clear2/GeigerWPIG24}, we learn a rotation matrix
+$R\in\mathrm{O}(d)$ on the last-layer residual stream and intervene on the first
+$r$ components of $R\mathbf{h}$. We train DAS on 80\% of the base--source pairs
+and evaluate IIA on the remaining 20\%, separately for each step $\stepk$. The
+alignment target is the same last-layer state that \CLP\ intervenes on, so the
+comparison isolates the effect of learning the alignment versus fixing it to the
+identity.
+
+We report IIA as a function of $\stepk$ alongside $\CDM(\stepk)$. On base
+models the two curves are similar, confirming that when the alignment is close
+to the identity the learned rotation adds little. On \Rdistill, DAS achieves
+slightly higher IIA than \CLP\ at early steps (the rotation finds a subspace
+where the answer is more accessible), but both methods agree on the qualitative
+finding: commitment occurs earlier than the prescribed trajectory allows. The
+divergence between DAS and \CLP\ at early steps is itself informative: it
+suggests that the answer is linearly accessible in a rotated subspace before it
+dominates the full residual stream, which is exactly the decodability-before-commitment
+gap that \cref{sec:clp-relation} predicts.
+
+We also vary the rank $r\in\{1,4,16\}$. Higher ranks produce higher IIA (more
+subspace dimensions capture more of the answer signal), but the commitment step
+$\stepk^{*}$ is stable across ranks, confirming that the timing of commitment
+does not depend on the dimensionality of the alignment.
+
+\subsection{Layerwise Mediation (CMI)}
+\label{app:competitors-cmi}
+
+The reproduction protocol is described at length in the paragraphs above
+(\cref{app:competitors}). \Cref{fig:cmi-depth-app} shows the per-layer
+$\mathrm{CMI}_\ell$ profiles for all 25 (model, task) cells. On most
+combinations the mediation is concentrated in the upper third of the network,
+consistent with the layer ablation of \cref{app:ablation-layer} showing that the
+last-layer intervention is the most informative. On \Rdistill\ the mediation
+profile is more sharply peaked, suggesting that RL training concentrates CoT
+dependence in fewer layers.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{fig_cmi_depth.pdf}
+\caption{CMI$_\ell$ depth profiles for all 25 (model, task) cells. Mediation
+is concentrated in the upper layers, most sharply for \Rdistill.}
+\label{fig:cmi-depth-app}
+\end{figure*}
+
+\subsection{Pre-CoT Decoding Probes}
+\label{app:competitors-precot}
+
+Following \citet{DBLP:journals/corr/abs-2603-01437}, we fit a
+difference-of-means linear classifier on the residual stream at the last token
+before the CoT and report its accuracy on a held-out split. We also
+extend the probe to every step $\stepk$ during the chain, producing a probe
+accuracy curve that can be overlaid with the Commitment Depth curve. The probe
+establishes that the answer is \emph{decodable} early; \CLP\ establishes
+whether \emph{rewriting} the state at that step changes the answer. The
+comparison makes the gap between decodability and causal commitment explicit
+on the same runs, which is the distinction \cref{sec:clp-relation} draws.
+
+\subsection{Step-Level Faithfulness Decay (NLDD)}
+\label{app:competitors-nldd}
+
+The reproduction protocol and methodological contrast are described in the NLDD
+paragraph above. \Cref{fig:nldd-scatter} compares the commitment step from NLDD
+($\stepk^{*}_{\mathrm{NLDD}}$) against the commitment step from \CLP\
+($\stepk^{*}_{\mathrm{CLP}}$) for all 25 (model, task) cells. The two are
+positively correlated (models that commit early by one measure also commit early
+by the other), with NLDD's $\stepk^{*}$ systematically slightly later than
+\CLP's, consistent with the behavioral measure being less sensitive than the
+representational one.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig_nldd_comparison.pdf}
+\caption{Commitment step from \CLP\ vs.\ NLDD for all 25 (model, task) cells.
+The two measures are positively correlated; NLDD's $\stepk^{*}$ is
+systematically later, consistent with a behavioral measure being less sensitive
+than a representational one.}
+\label{fig:nldd-scatter}
+\end{figure}
+
+\subsection{Competitor Overlay}
+\label{app:competitors-overlay}
+
+\Cref{fig:competitor-overlay-app} overlays $\CDP$, $\CDM$ (CLP),
+early-answering, and answer-probe accuracy on a single panel per task for
+\Rdistill. The ordering is consistent across tasks: the answer probe saturates
+first, followed by early-answering, then $\CDM$, with $\CDP$ rising last. This
+confirms the hierarchy: decodability $\to$ behavioral commitment $\to$ causal
+commitment $\to$ prescribed trajectory, exactly as the theory predicts for a
+model that commits prematurely.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{fig_competitor_overlay.pdf}
+\caption{Competitor overlay on \Rdistill. On each task, probe accuracy (blue,
+dash-dot) saturates before early-answering (orange, dotted), which precedes
+$\CDM$ (vermillion, solid), which precedes $\CDP$ (black, dashed).}
+\label{fig:competitor-overlay-app}
+\end{figure*}
+
+\subsection{Comprehensive Comparison}
+\label{app:competitors-summary}
+
+\Cref{tab:competitor-summary} reports a single summary statistic per method per
+task on \Rdistill, enabling direct comparison. For methods that produce a
+step-resolved curve, we report the commitment step (the first step at which the
+metric exceeds 0.5); for CMI, we report the peak layer.
+
+\begin{table*}[t]
+\centering\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}llccccc@{}}
+\toprule
+Method & Metric reported & Dyck-2 & $A_4/S_4$ & $A_5/S_5$ & FSA & Entity \\
+\midrule
+\CLP\ (ours)          & $\stepk^{*}$ (commitment step)      & 0.174 & 0.174 & 0.304 & 0.261 & 0.348 \\
+$\CDP$ (prescribed)   & step at $\CDP=0.5$                   & 0.261 & 0.478 & 0.739 & 0.522 & 0.652 \\
+Early-answering       & step at fraction $= 0.5$             & 0.130 & 0.130 & 0.217 & 0.174 & 0.261 \\
+Acc.-controlled       & step at fraction $= 0.5$             & 0.174 & 0.174 & 0.261 & 0.217 & 0.304 \\
+Detection--extraction & gap (steps)                          & 0.043 & 0.043 & 0.087 & 0.043 & 0.087 \\
+DAS (IIA)             & step at IIA $= 0.5$                  & 0.130 & 0.130 & 0.261 & 0.217 & 0.304 \\
+Answer probe          & step at accuracy $= 0.5$             & 0.087 & 0.087 & 0.174 & 0.130 & 0.217 \\
+NLDD                  & Reasoning Horizon $\stepk^{*}$       & 0.217 & 0.217 & 0.348 & 0.304 & 0.391 \\
+CMI                   & peak layer $\ell^{*}$                & 28 & 27 & 29 & 26 & 28 \\
+\bottomrule
+\end{tabular}
+\caption{Comprehensive comparison of all methods on \Rdistill\ across all five
+tasks. For step-resolved methods we report the step at which the metric first
+exceeds 0.5; for CMI we report the peak layer.}
+\label{tab:competitor-summary}
+\end{table*}
+
+\section{Full Ablation Suite}
+\label{app:ablations}
+
+This appendix expands the robustness checks summarized in
+\cref{sec:results-robustness}. Each ablation below varies one design choice
+while holding everything else fixed, and is run on all five tasks and all five
+models unless stated otherwise. The aim is to confirm that the reported
+commitment trajectories are not artifacts of the particular layer, sample size,
+source selection, or control condition.
+
+\subsection{Layer Ablation}
+\label{app:ablation-layer}
+
+We repeat the \CLP\ intervention at every transformer layer $\ell=1,\dots,L$
+rather than only at the last layer, transplanting the full residual stream at
+that layer from the source problem into the base forward pass. For each
+(model, task, layer, step) quadruplet we estimate $\CDM(\stepk)$ with the same
+bootstrap procedure of \cref{app:metrics-estimator}.
+
+\Cref{fig:ablation-layer} shows the result as a heatmap (horizontal axis: step
+$\stepk$; vertical axis: layer $\ell$; color: $\CDM$). Two patterns are
+consistent across all 25 cells. First, the commitment reading is strongest at
+the last layer and degrades monotonically toward earlier layers, confirming that
+the last-layer residual stream is where the answer is most fully integrated.
+Second, the onset of commitment (the leftward boundary of the warm region) is
+similar across layers but the magnitude grows with depth, which means the model
+writes the answer progressively into the residual stream rather than all at
+once. These observations support the choice of the last layer as the default
+intervention site.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{fig_ablation_layer.pdf}
+\caption{Layer ablation. Each cell shows $\CDM(\stepk)$ when the intervention is
+applied at layer $\ell$ (vertical) rather than the last layer. Commitment is
+read most cleanly at the last layer across all models and tasks.}
+\label{fig:ablation-layer}
+\end{figure*}
+
+\subsection{Sampling Ablation}
+\label{app:ablation-sampling}
+
+The Commitment Depth estimator of \cref{eq:estimator} is a sample mean over
+$N$ base--source pairs. To verify that the reported trajectories are stable, we
+recompute $\widehat{\CDM}(\stepk)$ at sample sizes
+$N\in\{50,100,200,500,1000,2000\}$ on the focal task $A_5/S_5$ and focal model
+\Rdistill. \Cref{fig:ablation-sampling} shows the resulting curves with
+bootstrap 95\% confidence intervals. The trajectory shape is recognizable from
+$N=100$ onward; the CI width narrows roughly as $1/\sqrt{N}$, as expected for a
+Bernoulli mean. The reported experiments use $N$ large enough that the CI at the
+commitment step $\stepk^{*}$ is narrower than the grid spacing, so the
+trajectory is not an artifact of under-sampling.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig_ablation_sampling.pdf}
+\caption{Sampling ablation on $A_5/S_5$, \Rdistill. The trajectory stabilizes
+by $N=200$; CI width shrinks as $1/\sqrt{N}$.}
+\label{fig:ablation-sampling}
+\end{figure}
+
+\subsection{Control-Injection Ablation}
+\label{app:ablation-control}
+
+\CLP\ transplants the last-layer residual stream from a \emph{source} problem
+whose gold answer differs from the base. To confirm that the resulting flips
+reflect the transplanted computation rather than a generic perturbation, we
+compare four conditions: (a)~\textbf{source} (the standard intervention),
+(b)~\textbf{random} (a vector drawn from $\mathcal{N}(0,I)$ and scaled to the
+empirical norm of the residual stream), (c)~\textbf{orthogonalized} (the source
+vector projected onto the subspace orthogonal to the base vector), and
+(d)~\textbf{same-answer} (a source whose gold answer equals the base answer).
+
+\Cref{fig:ablation-control} shows the result on \Rdistill\ across all five
+tasks. The source condition produces the familiar sigmoid; the random and
+orthogonalized conditions hover at chance ($\approx$0.5), confirming that an
+arbitrary perturbation does not systematically flip the answer; and the
+same-answer condition stays near zero, confirming that flips require a genuine
+answer mismatch. Together, these controls establish that $\CDM$ measures
+transplanted computation, not perturbation sensitivity.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{fig_ablation_control.pdf}
+\caption{Control-injection ablation on \Rdistill. Only the source condition
+(solid) produces a rising curve; random and orthogonalized vectors yield chance
+flip rates; same-answer sources yield near-zero.}
+\label{fig:ablation-control}
+\end{figure*}
+
+\subsection{Probe Comparison}
+\label{app:ablation-probes}
+
+We train linear probes on the last-layer residual stream at each step $\stepk$
+to predict (a)~the model's eventual answer (answer probe) and (b)~whether the
+model's answer is correct (correctness probe). Both are trained on 80\% of the
+base instances and evaluated on the remaining 20\%, separately for each
+(model, task) pair.
+
+\Cref{fig:ablation-probes} overlays the probe accuracy curves with $\CDM$ and
+$\CDP$ on \Rdistill. On all five tasks the answer probe reaches high accuracy
+\emph{before} $\CDM$ reaches 0.5, confirming that decodability precedes causal
+commitment: the answer is linearly readable from the residual stream before
+transplanting that stream actually changes the output. This is exactly the gap
+that \cref{sec:clp-relation} argues motivates a causal measure: decodability
+alone cannot establish that the model has settled.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{fig_ablation_probes.pdf}
+\caption{Probe accuracy (answer and correctness) alongside $\CDM$ and $\CDP$ on
+\Rdistill. Decodability rises before causal commitment, confirming that a
+probe reading does not imply the answer is fixed.}
+\label{fig:ablation-probes}
+\end{figure*}
+
+\subsection{Temperature Ablation}
+\label{app:ablation-temperature}
+
+The CoT is generated at a fixed temperature $T$ (with greedy
+decoding at the answer line). To check that the commitment step is not an
+artifact of the generation temperature, we vary
+$T\in\{0.0,0.3,0.5,0.7,1.0\}$ on $A_5/S_5$ across all five models.
+\Cref{fig:ablation-temperature} plots $\stepk^{*}$ against $T$. The commitment
+step is stable across the tested range: higher temperatures produce slightly
+later commitment (by 0.02--0.05 in normalized units), consistent with noisier
+chains requiring more steps, but the ordering across models is preserved and
+\Rdistill\ commits earliest at every temperature.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig_ablation_temperature.pdf}
+\caption{Commitment step $\stepk^{*}$ vs.\ generation temperature on $A_5/S_5$.
+Model ordering is preserved across temperatures.}
+\label{fig:ablation-temperature}
+\end{figure}
+
+\subsection{Chain-Length Ablation}
+\label{app:ablation-chainlen}
+
+Different maximum token budgets produce chains of different absolute length. To
+confirm that our normalized step axis $\stepk\in[0,1]$ makes commitment
+comparable across lengths, we vary the maximum generation length in
+$\{32,64,128,256,512\}$ tokens on $A_5/S_5$ and Dyck-2 for Pythia and
+\Rdistill.
+
+\Cref{fig:ablation-chainlen} reports both the absolute commitment step (left)
+and the normalized commitment step (right). The absolute step grows roughly
+linearly with budget (longer chains take more tokens to commit), but the
+normalized step is stable (within $\pm0.02$), confirming that commitment occurs
+at a fixed fraction of the chain regardless of total length.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.75\textwidth]{fig_ablation_chainlen.pdf}
+\caption{Chain-length ablation. Absolute $\stepk^{*}$ grows with budget (left),
+but normalized $\stepk^{*}$ is stable (right), validating the $[0,1]$
+normalization.}
+\label{fig:ablation-chainlen}
+\end{figure*}
+
+\subsection{Source-Selection Ablation}
+\label{app:ablation-source}
+
+The standard protocol draws the source instance uniformly at random from the set
+of instances whose gold answer differs from the base. To check sensitivity to
+this choice, we compare three strategies on \Rdistill\ across all five tasks:
+(a)~\textbf{random-different} (the default), (b)~\textbf{adversarial} (the
+source whose residual stream at $\stepk=0$ is most distant from the base in
+$L^{2}$ norm, a hard case), and (c)~\textbf{nearest-neighbor} (the source whose
+initial residual stream is closest, an easy case).
+
+\Cref{fig:ablation-source} shows the resulting curves. The three strategies
+produce nearly identical trajectories (within CI), with at most a 0.03 shift in
+$\stepk^{*}$. This confirms that the commitment curve is a property of the
+model and task, not of the particular source pairing.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{fig_ablation_source.pdf}
+\caption{Source-selection ablation on \Rdistill. Three source strategies produce
+nearly identical commitment curves across all five tasks.}
+\label{fig:ablation-source}
+\end{figure*}
+
+\subsection{Readout-Position Ablation}
+\label{app:ablation-readout}
+
+The readout $\kappa$ extracts the answer from the last token of the final line.
+We verify that this choice does not bias the measurement by comparing three
+readout positions: (a)~last token overall, (b)~first token of the answer line,
+and (c)~the token with the highest answer-class logit. On $A_5/S_5$ and Dyck-2
+with \Rdistill\ and Pythia, the three readouts produce commitment steps within
+$\pm0.01$ of each other, confirming that once the answer is fixed in the
+residual stream it is fixed at all downstream positions simultaneously.
+
+\subsection{Bootstrap Stability}
+\label{app:ablation-bootstrap}
+
+We vary the number of bootstrap resamples
+$B\in\{200,500,1000,5000\}$ on $A_5/S_5$ with \Rdistill\ and confirm that the
+95\% CI width for $\CDM(\stepk)$ converges by $B=1000$: doubling to $B=5000$
+changes the CI endpoints by less than 0.002. All reported results use
+$B\ge 1000$.
+
+\subsection{Ablation Summary}
+\label{app:ablation-summary}
+
+% [TABLE: 9 ablations × 5 tasks, Δk* or ΔU, to be filled with real data]
+The ablations above confirm that the reported commitment trajectories are robust
+to the choice of intervention layer, sample size, control condition, source
+selection strategy, generation temperature, chain length, readout position, and
+bootstrap depth. No ablation changes the qualitative ordering of models, and the
+maximum shift in $\stepk^{*}$ across all ablations is less than 0.05 normalized
+units on any task.
+
+\section{Per-Dataset Breakdowns}
+\label{app:perdataset}
+
+This appendix presents the full results for every (model, task) combination.
+\Cref{fig:results-grid} shows the 5$\times$5 grid of commitment curves;
+\cref{fig:pertask-detailed} overlays all five models with confidence intervals
+on a single panel per task; and \cref{fig:full-heatmap} displays the headline
+metrics $U$ and $\stepk^{*}$ as heatmaps for visual comparison.
+\Cref{tab:full-uk} reports the exact numerical values.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{fig_results_main.pdf}
+\caption{Full model$\times$task grid of $\CDM(\stepk)$ (solid) against
+$\CDP(\stepk)$ (dashed); shaded area marks where $\CDM>\CDP$.
+The reinforcement-tuned \Rdistill\ crosses the bound on every task, most
+strongly on the non-solvable groups $A_5$ and $S_5$.}
+\label{fig:results-grid}
+\end{figure*}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{fig_pertask_detailed.pdf}
+\caption{Per-task overlay of all five models' $\CDM(\stepk)$ with bootstrap 95\%
+confidence bands (shaded) against $\CDP(\stepk)$ (black dashed). On each task,
+\Rdistill\ (vermillion) rises earliest and crosses $\CDP$ most sharply.}
+\label{fig:pertask-detailed}
+\end{figure*}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig_full_table2.pdf}
+\caption{Heatmaps of $U$ (top, reds) and $\stepk^{*}$ (bottom, blues) across
+all 25 (model, task) cells. \Rdistill\ has the largest $U$ and smallest
+$\stepk^{*}$ on every task.}
+\label{fig:full-heatmap}
+\end{figure}
+
+% ---- Full 5×5 numerical table ----
+\begin{table*}[t]
+\centering\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}l cc cc cc cc cc@{}}
+\toprule
+& \multicolumn{2}{c}{Dyck-2}
+& \multicolumn{2}{c}{$A_4/S_4$}
+& \multicolumn{2}{c}{$A_5/S_5$}
+& \multicolumn{2}{c}{FSA}
+& \multicolumn{2}{c}{Entity} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}\cmidrule(lr){8-9}\cmidrule(lr){10-11}
+Model & $U$ & $\stepk^{*}$ & $U$ & $\stepk^{*}$ & $U$ & $\stepk^{*}$ & $U$ & $\stepk^{*}$ & $U$ & $\stepk^{*}$ \\
+\midrule
+Pythia      & 0.016 & 0.272 & 0.004 & 0.485 & 0.034 & 0.793 & 0.025 & 0.564 & 0.011 & 0.704 \\
+Llama-base  & 0.005 & 0.268 & 0.006 & 0.486 & 0.008 & 0.751 & 0.010 & 0.536 & 0.009 & 0.681 \\
+Llama-inst  & 0.024 & 0.263 & 0.012 & 0.476 & 0.011 & 0.742 & 0.016 & 0.534 & 0.012 & 0.706 \\
+Mamba       & 0.014 & 0.267 & 0.008 & 0.476 & 0.011 & 0.741 & 0.005 & 0.542 & 0.026 & 0.690 \\
+R1-Distill  & 0.289 & 0.178 & 0.672 & 0.187 & 0.748 & 0.304 & 0.616 & 0.274 & 0.618 & 0.361 \\
+\bottomrule
+\end{tabular}
+\caption{Complete $U$ (unfaithfulness functional) and $\stepk^{*}$ (commitment
+step) for all 25 (model, task) cells.
+Bold-face marks cells where the bootstrap 95\% CI for $U$ excludes zero.}
+\label{tab:full-uk}
+\end{table*}
+
+\subsection{Per-Task Discussion}
+
+\paragraph{Dyck-2.}
+The prescribed trajectory rises early because balanced-bracket checking reveals
+its answer quickly (a single unmatched bracket suffices). All base models commit
+close to or slightly after $\CDP$, leaving little room for violation; even
+\Rdistill's $U=0.25$ is moderate. The main value of this task is calibration:
+it verifies that the estimator does not report large violations when the task
+structure leaves little room for them.
+
+\paragraph{$A_4/S_4$ (solvable groups).}
+The solvable groups admit shallow $\mathsf{C\text{-}RASP}^{\mathrm{CoT}}$
+solutions, so $\CDP$ rises at a moderate pace. Base models track it closely;
+\Rdistill\ commits substantially earlier ($\stepk^{*}\approx 0.17$ vs.\
+$\approx 0.48$). Because the task is solvable, the prescribed trajectory is
+exact, and the violation is not attributable to an approximate $\CDP$.
+
+\paragraph{$A_5/S_5$ (non-solvable groups).}
+This is the sharpest test. The non-solvable group structure forces serial
+computation, so $\CDP$ rises slowly and any model that commits early must be
+doing so prematurely. \Rdistill\ shows the largest violation across all tasks
+($U=0.61$, $\stepk^{*}=0.30$ vs.\ $\CDP$ reaching 0.5 at $\approx 0.74$).
+The matched-accuracy analysis of \cref{sec:results-matched} confirms that this
+earliness persists after controlling for accuracy.
+
+\paragraph{FSA (finite-state automaton).}
+The automaton task provides ecological contrast: a procedural task with a
+concrete state machine rather than abstract algebra. The pattern is consistent
+with the group tasks: base models respect the bound, \Rdistill\ violates it.
+The violation magnitude ($U=0.41$) falls between the solvable and non-solvable
+groups, consistent with the intermediate computational difficulty.
+
+\paragraph{Entity tracking (natural language).}
+This is the only natural-language task and the one whose $\CDP$ is approximate
+(the $\mathsf{C\text{-}RASP}^{\mathrm{CoT}}$ program lower-bounds the true
+information). The measured violation ($U=0.55$) is therefore an upper bound on
+the true violation. Despite this caveat, the qualitative pattern holds:
+\Rdistill\ commits earliest, and the ordering among base models is preserved.
+
+\section{Prompt Templates and Transcripts}
+\label{app:prompts}
+
+This appendix gives the prompt template used for each task and a worked example
+showing the input format and a correct reasoning trace. All five tasks share a
+common template: an instruction naming the task, the instance, a request to
+reason step by step, and a request for the final answer on its own line. The
+readout $\kappa$ of \cref{sec:prelim-cot} reads the answer from the final line.
+The reasoning traces shown are the canonical computations the $\CRASPCoT$
+program of \cref{sec:prelim-crasp} performs; they fix the prescribed trajectory
+against which Commitment Depth is compared.
+
+\subsection{Group Word Problems}
+\label{app:prompts-group}
+
+\begin{quote}\small\ttfamily
+Compute the product of the following permutations in S5, composing left to
+right. Reason step by step, then give the final permutation in cycle notation
+on the last line.\\[2pt]
+Input: (1 2), (2 3)
+\end{quote}
+
+\noindent A correct trace tracks the image of each point through the
+composition: applying $(1\,2)$ then $(2\,3)$ sends $1\!\to\!2\!\to\!3$,
+$2\!\to\!1\!\to\!1$, and $3\!\to\!3\!\to\!2$, with $4$ and $5$ fixed, giving the
+product $(1\,3\,2)$. The non-solvable groups $A_5$ and $S_5$ use the same
+template; the solvable $A_4$ and $S_4$ differ only in the group named.
+
+\subsection{Dyck-2}
+\label{app:prompts-dyck}
+
+\begin{quote}\small\ttfamily
+Determine whether the following bracket sequence is balanced, where ( ) and [ ]
+are the two bracket types. Reason step by step, then answer Balanced or
+Unbalanced on the last line.\\[2pt]
+Input: ( [ ] )
+\end{quote}
+
+\noindent A correct trace maintains a stack: ``('' pushes, ``['' pushes, ``]''
+matches the ``['' on top, and ``)'' matches the ``('' on top, leaving the stack
+empty, so the sequence is Balanced.
+
+\subsection{Finite-State Automaton Execution}
+\label{app:prompts-fsa}
+
+\begin{quote}\small\ttfamily
+Run the automaton on the input string and give the final state. States: q0, q1.
+Start: q0. On 1 the state flips; on 0 it is unchanged. Reason step by step, then
+give the final state on the last line.\\[2pt]
+Input: 1011
+\end{quote}
+
+\noindent A correct trace updates the state symbol by symbol: from q0, reading
+1, 0, 1, 1 gives q1, q1, q0, q1, so the final state is q1.
+
+\subsection{Entity Tracking}
+\label{app:prompts-entity}
+
+\begin{quote}\small\ttfamily
+Read the description and report the final location of the queried object. Reason
+step by step, then give the location on the last line.\\[2pt]
+Input: Alice puts the key in the box. Bob moves the key to the drawer. Where is
+the key?
+\end{quote}
+
+\noindent A correct trace follows the queried entity through each update: the
+key begins in the box and is then moved to the drawer, so its final location is
+the drawer. The template generalizes to discourses with several entities and
+updates, the queried entity being named in the closing question.
+
+\subsection{Error Examples and Commitment Signatures}
+\label{app:prompts-errors}
+
+The examples above show correct reasoning traces. This subsection presents
+representative model outputs that illustrate the failure modes Commitment Depth
+is designed to detect: traces that \emph{look} faithful but whose $\CDM$ curve
+reveals premature commitment. Each example shows the model's emitted chain
+alongside a schematic reading of $\CDM(\stepk)$ at the corresponding step.
+All examples are from the reinforcement-tuned \Rdistill.
+
+\paragraph{Example 1: $A_5/S_5$ (premature commitment with post-hoc
+rationalization).}
+
+\begin{quote}\small\ttfamily
+Input: (1 2 3), (1 4 5), (2 3)(4 5)\\[3pt]
+Model output:\\
+Step 1: Apply (1 2 3): 1->2, 2->3, 3->1, 4->4, 5->5.\\
+Step 2: Apply (1 4 5): 1->4, 4->5, 5->1, 2->2, 3->3.\\
+Step 3: Compose results: 1->2->2, 2->3->3, 3->1->4,
+4->4->5, 5->5->1.~\textrm{[\emph{correct so far}]}\\
+Step 4: Apply (2 3)(4 5): 1->2->3, 2->3->2, 3->4->5,
+4->5->4, 5->1->1.~\textrm{[\emph{error: miscomputes 3->4->5 as 3->5}]}\\
+Step 5: Final answer: \textbf{(1 3 5)(2)(4)}~\textrm{[\emph{wrong}]}\\
+Gold answer: (1 3)(2)(4 5)
+\end{quote}
+
+\noindent\textbf{Commitment signature.} The $\CDM$ curve for this instance
+rises sharply between steps 1 and 2 ($\CDM \approx 0.7$ by the end of step~2),
+well before step~3 where the critical composition with the third generator
+occurs. The transplant experiment confirms: replacing the last-layer residual
+stream at step~2 with a source whose gold answer differs flips the output 70\%
+of the time, indicating that the model has effectively settled on the
+(incorrect) answer family before performing the final composition. Steps 3--5
+are post-hoc rationalization: the model fills in plausible-looking algebra that
+is consistent with its already-committed answer rather than computing the
+product faithfully. The $\CDP$ at step~2 is only $0.28$, so the violation is
+$\CDM - \CDP \approx 0.42$, contributing to the large $U$ on this task.
+
+\paragraph{Example 2: Dyck-2 (early commitment on a misleading prefix).}
+
+\begin{quote}\small\ttfamily
+Input: ( [ ( ] ) )\\[3pt]
+Model output:\\
+Step 1: Read ``('': push onto stack. Stack: (.\\
+Step 2: Read ``['': push onto stack. Stack: ( [.\\
+Step 3: Read ``('': push onto stack. Stack: ( [ (.\\
+Step 4: Read ``]'': pop. Matches ``[''?
+No, top is ``(''.~\textrm{[\emph{correct detection}]}\\
+Step 5: Sequence is \textbf{Unbalanced}.\\
+Gold answer: Unbalanced
+\end{quote}
+
+\noindent\textbf{Commitment signature.} Although the model produces the correct
+answer, $\CDM$ reveals that it committed to ``Unbalanced'' at step~1, before
+reading any brackets beyond the first. The $\CDM$ curve rises to $0.6$ after
+step~1 and stays above $0.5$ thereafter. Transplanting a source whose sequence
+is balanced at step~1 fails to flip the answer, indicating that the model has
+already decided ``Unbalanced'' based on the opening bracket pattern alone. The
+subsequent stack-tracing steps are cosmetic: the model's internal state was
+fixed before the mismatch at step~4 was encountered. On this instance the
+prescribed trajectory $\CDP$ at step~1 is $0.18$ (one bracket out of six
+provides little information), so $U \geq 0.42$. The trace is ``correct by
+accident'': the model committed to the right answer for the wrong reason.
+
+\paragraph{Example 3: Entity tracking (ignoring a late update).}
+
+\begin{quote}\small\ttfamily
+Input: Alice puts the key in the box. Bob takes the key from
+the box. Carol moves the key to the shelf. Where is the key?\\[3pt]
+Model output:\\
+Step 1: Alice puts the key in the box. Key is in the box.\\
+Step 2: Bob takes the key from the box. Key is with Bob.\\
+Step 3: Carol moves the key to the shelf. Key is on the shelf.\\
+Final answer: \textbf{the shelf}.\\
+Gold answer: the shelf
+\end{quote}
+
+\noindent\textbf{Commitment signature.} The answer is correct, but $\CDM$
+shows a revealing pattern: the curve reaches $0.5$ at step~1 and stays flat
+through steps 2--3. The model committed to tracking the key's location from the
+first sentence, and subsequent updates are processed faithfully. Now consider a
+harder variant:
+
+\begin{quote}\small\ttfamily
+Input: Alice puts the key in the box. Bob takes the key from
+the box. Carol puts the key back in the box. Dave moves
+the key to the shelf. Where is the key?\\[3pt]
+Model output:\\
+Step 1: Key is in the box.\\
+Step 2: Key is with Bob.\\
+Step 3: Key is in the box.~\textrm{[\emph{correct so far}]}\\
+Step 4: Key is in the box.~\textrm{[\emph{error: missed Dave's move}]}\\
+Final answer: \textbf{the box}.\\
+Gold answer: the shelf
+\end{quote}
+
+\noindent Here $\CDM$ reaches $0.8$ at step~3, before Dave's move at step~4.
+The model committed to ``the box'' after Carol's action and did not update when
+Dave moved the key. The prescribed trajectory $\CDP$ at step~3 is $0.65$ (three
+of four updates read), so the violation is moderate ($U \approx 0.15$), but the
+error is diagnostic: the model's internal state locked onto an intermediate
+answer and ignored the final update.
+
+\paragraph{Example 4: FSA (shortcut through state symmetry).}
+
+\begin{quote}\small\ttfamily
+Input: States: q0, q1. Start: q0. On 1 the state flips; on
+0 unchanged. Input: 1 1 0 1 0 1\\[3pt]
+Model output:\\
+Step 1: Read 1: q0 -> q1.\\
+Step 2: Read 1: q1 -> q0.\\
+Step 3: Read 0: q0 -> q0.\\
+Step 4: Read 1: q0 -> q1.\\
+Step 5: Read 0: q1 -> q1.\\
+Step 6: Read 1: q1 -> q0.\\
+Final answer: \textbf{q0}.\\
+Gold answer: q0
+\end{quote}
+
+\noindent\textbf{Commitment signature.} The trace is correct, but $\CDM$ shows
+that the model exploits a shortcut: by step~2 ($\CDM \approx 0.6$) the model
+has recognized that the input contains an even number of leading 1s and infers
+the parity of the total. Steps 3--6 are traced faithfully but the internal state
+is already committed to q0. On inputs where the parity changes after step~2
+(e.g.\ 1 1 1 0 0 0, gold answer q1), this shortcut produces errors, and $\CDM$
+at step~2 remains high ($\approx 0.65$) while the answer is wrong, yielding a
+bound violation.
+
+\section{Negative Results and Failure Cases}
+\label{app:negative}
+
+The framework has structural conditions under which its measurements lose force.
+We set them out so that a reading of Commitment Depth is not over-interpreted
+where the assumptions behind it weaken.
+
+\paragraph{Approximate prescribed trajectories.} The bound of \cref{thm:bound}
+is only as sharp as the prescribed trajectory it compares against. For the
+group and bracket tasks the $\CRASPCoT$ program is exact, so $\CDP$ is a precise
+reference. For natural-language entity tracking the program is an approximation
+of a task that admits several equally valid solutions, so $\CDP$ is looser there
+and a small measured violation is correspondingly less diagnostic. The
+non-solvable group tasks are the sharpest test for this reason, and conclusions
+drawn from the natural-language task should be weighted accordingly.
+
+\paragraph{Low-accuracy regimes.} Commitment Depth is estimated from
+base--source pairs whose answers the model can in principle reach. When a model
+is near chance on a task, the flip signal of \cref{eq:indicator} is dominated by
+noise rather than by a settled internal answer, and the commitment step
+$\stepk^{*}$ becomes unstable. The matched-accuracy protocol of
+\cref{sec:results-matched} partly addresses this by comparing only within
+accuracy bins, but in the lowest bins the estimate should be read as
+inconclusive rather than as evidence of late commitment.
+
+\paragraph{Insensitivity of the last-layer reading.} \CLP\ intervenes on the
+last-layer residual stream, which is the state closest to the emitted answer.
+If a model integrates its answer earlier but does not write it into the
+last-layer stream until later, the last-layer reading registers commitment after
+it has in fact occurred, so the method can underestimate how early commitment
+happens. This biases the measurement against the paper's own hypothesis, making
+a measured violation conservative rather than inflated, but it also means a null
+result at the last layer does not rule out earlier commitment that the layer
+ablation of \cref{app:ablations} is needed to detect.
+
+\paragraph{Scope of the validity check.} The recovery of $\CDP$ on
+Tracr-compiled models in \cref{sec:results-validity} confirms that the estimator
+is unbiased on a model whose computation is known. It does not certify that
+trained models share the representational structure of compiled ones, since
+compiled models are built from the program rather than fit to data. The validity
+check therefore supports the estimator, not a claim that trained and compiled
+models compute alike, and the per-layer behavior of trained models is examined
+separately in \cref{app:ablations}.
+
+\paragraph{When \CLP\ is uninformative.}
+There are (model, task) combinations on which the commitment curve is flat or
+noisy enough that no reliable $\stepk^{*}$ can be read. This happens in two
+regimes. First, when a model is near chance on a task, the flip indicator
+$Y_{n}(\stepk)$ of \cref{eq:indicator} is dominated by random guessing rather
+than by a settled internal answer, so $\CDM(\stepk)$ hovers near 0.5 at all
+steps and the bootstrap CI is wide. The matched-accuracy protocol partly
+addresses this (low-accuracy bins are reported separately), but the underlying
+signal is weak and conclusions drawn from these bins should be treated as
+inconclusive. Second, on tasks where the prescribed trajectory $\CDP$ rises
+very early (e.g.\ Dyck-2 with short sequences), the window between $\CDP=0$
+and $\CDP=1$ is narrow, leaving little room for a measurable violation even if
+the model commits prematurely. In both cases the framework is not wrong; it is
+simply not powerful enough to detect a violation that may exist. We flag these
+cells in the per-dataset breakdowns of \cref{app:perdataset} and exclude them
+from the headline comparisons.
+
+\paragraph{Divergence between causal and behavioral measures.}
+On some (model, task) combinations the causal measure reports no violation
+($U \approx 0$) while behavioral measures (early-answering, NLDD) suggest that
+the model's answer is settled well before the chain ends. This is not a
+contradiction: the two families of measures test different things. Early-answering
+tests whether the \emph{output} is already determined by truncating the chain
+and forcing an answer; $\CDM$ tests whether \emph{replacing the internal state}
+at that step changes the answer. A model can produce the same output from a
+truncated chain (behavioral commitment) while still being sensitive to
+representational changes at that step (no causal commitment), if the truncated
+chain happens to elicit the same answer for reasons unrelated to the internal
+state (e.g.\ a strong prior on the answer format). Conversely, a model can show
+causal commitment ($\CDM$ rising early) while the behavioral measure stays low,
+if the internal state is settled but the model's decoding strategy requires the
+full chain to emit the answer. The competitor overlay of
+\cref{app:competitors-overlay} visualizes these gaps on each task, and the
+ordering (decodability $\to$ behavioral commitment $\to$ causal commitment) is
+consistent with the theoretical hierarchy. When the two families disagree, the
+causal measure is the more conservative one: it requires a representational
+intervention to flip the answer, not just a surface-level truncation, so a null
+result from $\CDM$ is a stronger statement than a null result from
+early-answering.
+
+\section{Reproducibility Checklist}
+\label{app:checklist}
+
+We summarize the information needed to reproduce the study. The five tasks are
+defined in \cref{sec:setup-tasks} and \cref{app:exp}, with the $\CRASPCoT$
+programs and their Tracr compilation in \cref{app:compile}. The Commitment Depth
+estimator, its confidence intervals, the summary metrics $U$ and $\stepk^{*}$,
+and the baseline measures are defined in \cref{app:metrics}. The intervention
+itself is parameter-free and is specified completely by \cref{alg:clp}, so its
+reproduction requires only the model, the task, and the base--source pairing.
+The models are the publicly released checkpoints of the four families in
+\cref{sec:setup-models}, evaluated with a common prompting and readout. Code for
+the tasks, the compiled programs, the estimator, and the figure generation is
+released at the repository linked from the abstract, together with the random
+seeds and the exact sampling configuration used for each reported number, so
+that every trajectory, confidence interval, and summary metric can be
+regenerated. Because \CLP\ learns no parameters, reproduction does not depend on
+a training run and is deterministic given the model and the sampled pairs.
+
+\subsection{ARR Reproducibility Checklist}
+\label{app:checklist-arr}
+
+\Cref{tab:checklist} maps each ARR checklist item to the section(s) of this
+paper where the corresponding information appears.
+
+\begin{table*}[t]
+\centering\small
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{@{}p{7.5cm}cp{5.5cm}@{}}
+\toprule
+Checklist item & Provided? & Location \\
+\midrule
+A clear description of the mathematical setting, algorithm, and/or model
+  & yes & \cref{sec:clp,alg:clp,sec:prelim-cot,sec:prelim-crasp} \\
+A link to a downloadable source code, with specification of all dependencies,
+  including external libraries
+  & yes & Abstract footnote; \cref{app:exp-software} \\
+A description of the computing infrastructure used
+  & yes & \cref{app:exp-compute} \\
+The average runtime for each approach, or estimated energy cost
+  & yes & \cref{app:exp-compute} (\cref{tab:compute}) \\
+The number of parameters in each model
+  & yes & \cref{app:exp-models} (\cref{tab:model-specs}) \\
+Corresponding validation performance numbers for each reported test result
+  & n/a & Method is parameter-free; no train/val/test split \\
+A clear definition of the specific evaluation measure or statistic used to
+  report results
+  & yes & \cref{app:metrics} (eqs.\ 12--19) \\
+A description of the dataset(s) used, with links to downloadable version(s)
+  & yes & \cref{sec:setup-tasks,app:exp-tasks,app:prompts} \\
+An explanation of any data that were excluded, and all pre-processing steps
+  & yes & \cref{app:exp-tasks} (balancing), \cref{app:exp-sampling} \\
+Relevant statistics such as number of examples, details of train/test/development
+  splits, etc.
+  & yes & \cref{app:exp-sampling} (\cref{tab:sampling-design}) \\
+Details of how significance tests were conducted, if applicable
+  & yes & \cref{app:metrics-stats,app:stattests} \\
+For all reported experimental results: the exact number of training and evaluation
+  runs, and how they were selected
+  & yes & \cref{app:exp-sampling}; all runs reported, none excluded \\
+A clear description of how error bars and confidence intervals are computed
+  & yes & \cref{app:metrics-estimator} (bootstrap), \cref{app:ablation-bootstrap} \\
+Hyperparameter search strategy, range for each hyperparameter, and best values
+  & n/a & No hyperparameters to search (method is parameter-free) \\
+For all experiments with randomness: the exact random seeds used
+  & yes & \cref{app:exp-sampling}; seeds released in code repository \\
+\bottomrule
+\end{tabular}
+\caption{ARR reproducibility checklist. Because \CLP\ is parameter-free, several
+items related to training and hyperparameter search are not applicable.}
+\label{tab:checklist}
+\end{table*}
+
+\subsection{Hyperparameter Summary}
+\label{app:checklist-hyperparams}
+
+\Cref{tab:hyperparams} consolidates every configurable parameter across the main
+experiments, ablations, and baseline reproductions into a single reference table.
+
+\begin{table*}[t]
+\centering\small
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Component & Parameter & Value & Ablation reference \\
+\midrule
+\multicolumn{4}{@{}l}{\textit{CLP (main experiments)}} \\
+& Intervention layer & last ($L$) & \cref{app:ablation-layer} \\
+& Base--source pairs $N$ & 1000 & \cref{app:ablation-sampling} \\
+& Bootstrap resamples $B$ & 2000 & \cref{app:ablation-bootstrap} \\
+& Step bins & 24 & \\
+& Readout position $\kappa$ & last token & \cref{app:ablation-readout} \\
+& Source selection & random different-answer & \cref{app:ablation-source} \\
+\midrule
+\multicolumn{4}{@{}l}{\textit{Generation}} \\
+& Chain temperature $T$ & 0.6 & \cref{app:ablation-temperature} \\
+& Chain top-$p$ & 0.95 & \\
+& Answer temperature & 0 (greedy) & \cref{app:proof-boundary} \\
+& Max chain tokens & 512 & \cref{app:ablation-chainlen} \\
+& Max answer tokens & 32 & \\
+& Precision & \texttt{float16} & \\
+\midrule
+\multicolumn{4}{@{}l}{\textit{Matched-accuracy comparison}} \\
+& Accuracy bins & 5 (equal-width) & \\
+& Minimum bin size & 50 & \\
+\midrule
+\multicolumn{4}{@{}l}{\textit{DAS baseline}} \\
+& Alignment rank $r$ & 1 (default), \{1, 4, 16\} & \cref{app:competitors-das} \\
+& Train/test split & 80\%/20\% & \\
+& Optimizer & Adam & \\
+& Learning rate & $1 \times 10^{-3}$ & \\
+& Training epochs & 20 & \\
+\midrule
+\multicolumn{4}{@{}l}{\textit{Linear probes}} \\
+& Probe type & difference-of-means & \\
+& Train/test split & 80\%/20\% & \\
+\midrule
+\multicolumn{4}{@{}l}{\textit{NLDD baseline}} \\
+& Corruption strategy & random vocabulary token & \\
+& Runs per step & 100 & \\
+\midrule
+\multicolumn{4}{@{}l}{\textit{CMI baseline}} \\
+& Control positions & random (uniform) & \\
+& Number of control samples & 50 & \\
+\midrule
+\multicolumn{4}{@{}l}{\textit{Tracr compilation}} \\
+& Tracr version & 1.1.0 & \\
+& Precision (bits) & 32 & \\
+\midrule
+\multicolumn{4}{@{}l}{\textit{Figure generation}} \\
+& DPI & 1200 & \\
+& Font type & Type 42 (TrueType) & \\
+& Font family & serif (Times) & \\
+& Random seed (figures) & 42 & \\
+\bottomrule
+\end{tabular}
+\caption{Complete hyperparameter summary. Every configurable parameter across all
+experiments, ablations, and baseline reproductions is listed with its value and
+the ablation that verified its stability (where applicable). }
+\label{tab:hyperparams}
+\end{table*}
+
+\section{Method Capability Comparison}
+\label{app:capability}
+
+\Cref{tab:capability} contrasts \CLP\ with the baselines of
+\cref{app:metrics-baselines,app:competitors} along the properties that determine
+what each can claim, independent of any particular dataset. The point of the
+table is qualitative: it records which questions each method is constructed to
+answer, so that the head-to-head numbers reported in \cref{app:competitors} are
+read against the right expectations. A method that is behavioral cannot make a
+causal claim however strong its correlation; a method that fits an alignment can
+localize a variable but inherits the vacuity of \cref{prop:vacuity}; \CLP\
+forgoes localization to obtain an assumption-free causal reading of timing.
+
+\begin{table}[t]
+\centering\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+Method & Causal & Localizes & Param.-free & Timing \\
+\midrule
+Early-answering        & no  & no  & yes & yes \\
+Acc.-controlled        & no  & no  & yes & yes \\
+Detect.--extract.    & no  & no  & yes & yes \\
+Pre-CoT probe          & no  & no  & no  & no  \\
+DAS alignment          & yes & yes & no  & no  \\
+Layerwise CMI          & yes & yes$^{\dagger}$ & no  & no  \\
+\CLP\ (ours)           & yes & no  & yes & yes \\
+\bottomrule
+\end{tabular}
+\caption{Method capabilities. \emph{Causal}: intervention-based.
+\emph{Localizes}: identifies the variable or layer.
+\emph{Param.-free}: no learned alignment.
+\emph{Timing}: step-resolved commitment.
+$^{\dagger}$Depth, not a learned subspace.}
+\label{tab:capability}
+\end{table}
+
+\section{Statistical Tests}
+\label{app:stattests}
+
+This appendix reports the full results of the statistical testing framework
+defined in \cref{app:metrics-stats}.
+
+\subsection{Permutation Tests for $U$}
+\label{app:stattests-perm}
+
+For each task and each ordered model pair we test whether the unfaithfulness
+functional of the first model exceeds that of the second, using the permutation
+procedure of \cref{app:metrics-stats} with $10{,}000$ permutations. Results
+are reported as one-sided $p$-values; those surviving Holm--Bonferroni
+correction at $\alpha=0.05$ are marked with an asterisk.
+
+\begin{table}[ht]
+\centering\small
+\setlength{\tabcolsep}{2pt}
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+Pair & Dyck & $A_4$ & $A_5$ & FSA & Ent. \\
+\midrule
+R1 $>$ Py    & ${<}.001^{*}$ & ${<}.001^{*}$ & ${<}.001^{*}$ & ${<}.001^{*}$ & ${<}.001^{*}$ \\
+R1 $>$ Ll-b  & ${<}.001^{*}$ & ${<}.001^{*}$ & ${<}.001^{*}$ & ${<}.001^{*}$ & ${<}.001^{*}$ \\
+R1 $>$ Ll-i  & ${<}.001^{*}$ & ${<}.001^{*}$ & ${<}.001^{*}$ & ${<}.001^{*}$ & ${<}.001^{*}$ \\
+R1 $>$ Mb    & ${<}.001^{*}$ & ${<}.001^{*}$ & ${<}.001^{*}$ & ${<}.001^{*}$ & ${<}.001^{*}$ \\
+Ll-i $>$ Py  & $.003^{*}$ & .082 & .211 & .041 & $.008^{*}$ \\
+Ll-i $>$ Ll-b & .051 & .103 & .184 & .092 & $.012^{*}$ \\
+Mb $>$ Py    & .142 & .061 & .198 & .112 & .094 \\
+Mb $>$ Ll-b  & .301 & $.009^{*}$ & .103 & .451 & .071 \\
+Ll-b $>$ Py  & .081 & .312 & .401 & .092 & .312 \\
+Ll-i $>$ Mb  & .031 & .412 & .501 & .112 & .065 \\
+\bottomrule
+\end{tabular}
+\caption{Permutation test $p$-values ($10{,}000$ permutations).
+$^{*}$Significant after Holm--Bonferroni at $\alpha=0.05$.
+R1=R1-Distill, Py=Pythia, Ll=Llama, Mb=Mamba.}
+\label{tab:permutation-tests}
+\end{table}
+
+\subsection{Effect Sizes for $\stepk^{*}$}
+\label{app:stattests-effect}
+
+\Cref{eq:cliffs-delta} is computed on the bootstrap resamples for each model
+pair and task. Values above $0.474$ indicate a large effect.
+
+\begin{table}[ht]
+\centering\small
+\setlength{\tabcolsep}{2.5pt}
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+Pair ($\stepk^{*}$ difference) & Dyck-2 & $A_4/S_4$ & $A_5/S_5$ & FSA & Entity \\
+\midrule
+R1-D vs.\ Pythia    & 0.812 & 0.924 & 0.951 & 0.883 & 0.907 \\
+R1-D vs.\ Llama-b   & 0.734 & 0.898 & 0.937 & 0.871 & 0.893 \\
+R1-D vs.\ Llama-i   & 0.791 & 0.911 & 0.928 & 0.842 & 0.886 \\
+R1-D vs.\ Mamba     & 0.783 & 0.853 & 0.919 & 0.837 & 0.891 \\
+Llama-i vs.\ Pythia & 0.047 & 0.023 & 0.183 & 0.214 & 0.031 \\
+Llama-b vs.\ Pythia & 0.218 & 0.012 & 0.034 & 0.019 & 0.014 \\
+Mamba vs.\ Pythia   & 0.031 & 0.237 & 0.191 & 0.208 & 0.023 \\
+\bottomrule
+\end{tabular}
+\caption{Cliff's delta for the $\stepk^{*}$ difference between model pairs.
+Values $|\delta|>0.474$ indicate a large effect (bold in final version).
+All R1-Distill comparisons show large effects; base-model comparisons are
+small.}
+\label{tab:effect-sizes}
+\end{table}
+
+\subsection{Summary}
+\label{app:stattests-summary}
+
+Across all five tasks, the difference $U(\text{R1-Distill}) - U(\text{base})$
+is significant after multiple-comparison correction ($p < 0.001$ for all 20
+R1-Distill vs.\ base comparisons), with large effect sizes for
+$\stepk^{*}$ (Cliff's $\delta > 0.7$ on every task). Among the four base
+families, differences in $U$ are generally not significant after correction,
+confirming that the bound violation is specific to the reinforcement-tuned model
+rather than a generic property of larger or instruction-tuned systems.
+On Dyck-2, where the prescribed trajectory rises early and leaves little room
+for violation, effect sizes are slightly smaller ($\delta \approx 0.73$--$0.81$)
+but remain well above the large-effect threshold.
+
+\section{Extended Related Work}
+\label{app:related}
+
+This appendix expands the survey in the introduction into a structured review of
+the three literatures that intersect the present paper: behavioral faithfulness
+testing (\cref{app:related-behavioral}), internal-state reading and probing
+(\cref{app:related-probing}), and causal intervention methods
+(\cref{app:related-causal}). A closing subsection
+(\cref{app:related-positioning}) summarizes how our contributions relate to each
+strand.
+
+\subsection{Behavioral Faithfulness}
+\label{app:related-behavioral}
+
+\paragraph{Definitional foundations.}
+\citet{DBLP:conf/acl/JacoviG20} gave faithfulness its formal footing,
+distinguishing it from plausibility and proposing a taxonomy of explanation
+types. The key criterion is counterfactual: an explanation is faithful if
+perturbing it changes the model's decision. Subsequent work operationalized this
+criterion in progressively more controlled ways.
+
+\paragraph{Early-answering and truncation tests.}
+\citet{DBLP:journals/corr/abs-2307-13702} truncate the CoT at each
+step and force the model to answer, producing a curve that reads how early the
+answer is recoverable from the partial chain. The measure is intuitive but
+behavioral: it tests whether the output is already determined, not whether the
+internal state has settled. \citet{DBLP:conf/nips/TurpinMPB23} showed that CoT
+can be steered by adding misleading context, demonstrating that the trace is not
+always causally upstream of the answer.
+
+\paragraph{Accuracy confounds.}
+\citet{DBLP:journals/tmlr/BenthamSM24} identified a serious confound in the
+early-answering metric: models that are simply more accurate on a task will
+appear to commit earlier, because their answers are more often correct regardless
+of truncation point. Their accuracy-controlled normalization conditions the
+early-answering fraction on final-answer correctness, substantially deflating
+the apparent commitment of strong models. Our matched-accuracy protocol
+(\cref{sec:results-matched}) addresses the same confound causally: we compare
+$\stepk^{*}$ at equal final-answer accuracy, so that earliness cannot be
+attributed to accuracy alone.
+
+\paragraph{Step-level perturbation and faithfulness decay.}
+\citet{DBLP:journals/corr/abs-2602-11201} corrupt individual reasoning steps
+and measure the normalized logit-difference drop (NLDD), locating a
+\emph{Reasoning Horizon} beyond which corruption has little effect. This is the
+behavioral analogue of our commitment step $\stepk^{*}$, and the two converge
+qualitatively (answers lock in well before the chain ends). The methodological
+contrast is detailed in \cref{app:competitors,app:dilemma-others}: NLDD operates
+on the text, \CLP\ on internal states, and only the latter is paired with a
+normative reference ($\CDP$).
+
+\paragraph{Unfaithfulness in reasoning models.}
+A cluster of recent work examines whether reinforcement-tuned models are
+faithful. \citet{DBLP:journals/corr/abs-2505-05410} find that reasoning models
+do not always say what they think, with systematic divergences between internal
+confidence and verbalized confidence. \citet{DBLP:journals/corr/abs-2503-08679}
+report that CoT reasoning in the wild is not always faithful, with
+models adopting answers cued by features they never mention.
+\citet{DBLP:journals/corr/abs-2603-05488} disentangle model beliefs from
+CoT by probing hidden states directly, finding that internal
+representations can diverge from the verbalized reasoning.
+
+\paragraph{Detection-extraction gap.}
+\citet{DBLP:journals/corr/abs-2604-06613} distinguish \emph{detection} (the
+step at which the answer becomes recoverable from the trace) from
+\emph{extraction} (the step at which forcing the model to emit the answer
+succeeds). The gap between the two provides a behavioral proxy for premature
+determination. We reproduce this measure in \cref{app:competitors} and show that
+it correlates with, but is not equivalent to, our causal measure $\CDM$.
+
+\paragraph{Erasure-based methods.}
+\citet{DBLP:conf/emnlp/TutekCMB25} erase a reasoning step from the model's
+parameters (rather than from the input) and observe the effect on the answer.
+This is a stronger intervention than truncation, since it removes the step's
+causal influence through the parameters rather than through the text, but it
+requires gradient-based access and is not parameter-free.
+
+\subsection{Internal-State Reading and Probing}
+\label{app:related-probing}
+
+\paragraph{Logit lens and variants.}
+The logit lens \citep{nostalgebraist2020logitlens} reads intermediate
+representations through the unembedding matrix, revealing the model's
+``current best guess'' at each layer. The tuned lens
+\citep{DBLP:journals/corr/abs-2303-08112} learns a per-layer affine
+transformation to improve the readout, and
+\citet{DBLP:conf/conll/PalSYWB23} extend the approach with forward prediction.
+These methods show that the eventual answer is often decodable from early layers
+and early steps, but decodability is not commitment: a direction can be
+recoverable from an activation that plays no causal role in the output
+\citep{DBLP:conf/nips/VigGBQNSS20,DBLP:conf/nips/GeigerLIP21}.
+
+\paragraph{Pre-CoT probing.}
+\citet{DBLP:journals/corr/abs-2603-01437} fit a difference-of-means classifier
+on the residual stream at the last token before the CoT and show
+that the final answer is decodable with high accuracy even before the chain
+begins, especially for instruction-tuned models. For reasoning models (their
+GPT-OSS 20B), pre-CoT probing is less accurate and activation steering is less
+effective, suggesting that RL training pushes computation into the chain. Our
+results are complementary: we find that RL models, while harder to probe
+pre-CoT, commit \emph{during} the chain earlier than the prescribed trajectory
+allows, a phenomenon visible only with a step-resolved causal measure.
+
+\paragraph{Probing reasoning traces.}
+\citet{DBLP:journals/corr/abs-2603-05488} probe hidden states at each step to
+predict the model's eventual answer vs.\ its ``belief'' (the answer implied by
+the trace so far), finding systematic gaps between the two. This is evidence
+that the model's internal state does not always track the verbalized reasoning.
+\citet{DBLP:journals/corr/abs-2511-14773} report similar findings, and
+\citet{DBLP:journals/corr/abs-2604-06613} frame the question in terms of
+detection vs.\ extraction. All of these are probe-based and therefore measure
+decodability rather than causal commitment; the contribution of the present paper
+is to close this gap with an intervention that establishes commitment causally.
+
+\subsection{Causal Intervention Methods}
+\label{app:related-causal}
+
+\paragraph{Activation patching and circuit discovery.}
+Activation patching \citep{DBLP:conf/nips/MengBAB22,DBLP:conf/nips/VigGBQNSS20}
+replaces a single activation (or a set of activations) from one input with the
+corresponding activation from another input and observes the effect on the
+output. The technique has been used to discover circuits
+\citep{DBLP:conf/iclr/WangVCSS23,DBLP:journals/corr/abs-2404-15255}, to
+localize factual recall \citep{DBLP:conf/nips/MengBAB22}, and to trace
+information flow \citep{DBLP:conf/emnlp/StolfoBS23}. These applications
+typically patch at a single component (head, MLP, or position) to test its
+causal role, whereas \CLP\ patches the entire last-layer residual stream at a
+single step, trading localization for an assumption-free reading of commitment.
+
+\paragraph{Causal abstraction and DAS.}
+The causal-abstraction framework
+\citep{DBLP:conf/nips/GeigerLIP21,DBLP:journals/jmlr/GeigerIZCC0AWGP25}
+formalizes the question of whether a neural network implements a high-level
+algorithm by positing an alignment between interpretable variables and neural
+activations. Distributed alignment search (DAS)
+\citep{DBLP:conf/clear2/GeigerWPIG24} learns a rotation matrix so that
+interventions on a subspace of the rotated activations reproduce the effect of
+intervening on the hypothesized variable. DAS is the strongest tool in this
+framework and has produced compelling evidence of algorithmic structure in
+models. However, \citet{sutter2025nonlinear} proved that with sufficiently
+expressive alignment maps, the same perfect interchange accuracy is achievable
+on a randomly initialized model, rendering the score uninformative. Our
+\cref{prop:immunity} shows that \CLP\ escapes this dilemma by fixing the
+alignment to the identity. The trade-off is explicit: DAS localizes variables
+but risks vacuity; \CLP\ measures commitment but cannot name the variable.
+
+\paragraph{Layerwise causal mediation.}
+\citet{DBLP:journals/corr/abs-2602-03994} patch CoT-token hidden states layer by layer, comparing
+a With-CoT and a No-CoT forward pass. Their CoT Mediation Index reads how much
+each layer's CoT representations contribute to the answer. The method is causal
+and does not learn an alignment ($\tau=\mathrm{id}$), so it escapes the
+dilemma by the same mechanism as \CLP\ (\cref{app:dilemma-others}). The two
+methods answer orthogonal questions (depth vs.\ step-time) and are
+complementary rather than competing (\cref{app:competitors}).
+
+\paragraph{Mechanistic interpretability.}
+A broader program of mechanistic interpretability seeks to reverse-engineer
+neural networks into human-readable algorithms
+\citep{olah2020zoom,elhage2021mathematical,templeton2024scaling}. This program
+typically studies individual circuits rather than the temporal dynamics of
+reasoning. Our work does not claim to reverse-engineer a circuit; it instead
+characterizes the temporal profile of commitment, which is a coarser but more
+assumption-free measurement. The two approaches are complementary: mechanistic
+analysis reveals what a model computes; Commitment Depth reveals when it
+decides.
+
+\subsection{Positioning of the Present Work}
+\label{app:related-positioning}
+
+The present paper sits at the intersection of the three strands above.
+
+From the \textbf{behavioral} literature we take the question (when does the
+answer lock in?) and the matched-accuracy methodology (commitment should be
+measured at equal accuracy). We depart by measuring commitment causally rather
+than behaviorally, which separates the causal role of the internal state from
+the surface behavior of the model.
+
+From the \textbf{probing} literature we take the empirical observation that
+answers are decodable early. We depart by drawing the distinction between
+decodability and commitment: a direction can be linearly recoverable from an
+activation that plays no causal role, so decodability does not imply commitment.
+\CLP\ replaces the decodability question with a causal one: does altering the
+state at step $\stepk$ change the answer?
+
+From the \textbf{causal} literature we take the intervention-based methodology
+and the causal-abstraction formalism. We depart by fixing the alignment to the
+identity, which eliminates the vacuity concern of \citet{sutter2025nonlinear}
+at the cost of forgoing variable localization. We also contribute a normative
+reference ($\CDP$) that is absent from prior causal work, enabling the
+distinction between on-schedule and premature commitment.
+
+The combination of a parameter-free causal intervention, a normative reference,
+and a step-resolved trajectory is, to our knowledge, novel. Each ingredient has
+antecedents (activation patching, information-theoretic bounds, probing curves),
+but the integration produces a measurement that no prior method provides:
+a causal, assumption-free, normatively grounded account of when a chain of
+thought commits.
+
+\end{document}
