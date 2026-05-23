@@ -14,7 +14,7 @@
 
 ## TL;DR
 
-**A reinforcement-tuned reasoning model fixes its answer inside the residual stream before the chain of thought has read enough information to justify that answer.** We define *Commitment Depth* — the normalized step at which transplanting a counterfactual state flips the output — and prove a *faithfulness bound*: no faithful executor can commit earlier than the information-theoretic reference trajectory derived from a C-RASP^CoT program. Causal Lookahead Probing (CLP) is the parameter-free estimator that measures this, immune to the non-linear representation dilemma. Across 5 state-tracking tasks and 5 model families, the RL-tuned model violates the bound on every task (U up to 0.748 on A₅/S₅), committing 2.43× earlier than base models at matched accuracy, while all non-RL families stay within the bound.
+**A reinforcement-tuned reasoning model fixes its answer inside the residual stream before the chain of thought has read enough information to justify that answer.** We define *Commitment Depth*, the normalized step at which transplanting a counterfactual state flips the output, and prove a *faithfulness bound*: no faithful executor can commit earlier than the information-theoretic reference trajectory derived from a C-RASP^CoT program. Causal Lookahead Probing (CLP) is the parameter-free estimator that measures this, immune to the non-linear representation dilemma. Across 5 state-tracking tasks and 5 model families, the RL-tuned model violates the bound on every task (U up to 0.748 on A₅/S₅), committing 2.43× earlier than base models at matched accuracy, while all non-RL families stay within the bound.
 
 ---
 
