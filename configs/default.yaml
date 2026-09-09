@@ -1,0 +1,37 @@
+# Default protocol. Every value here is a knob the ablations vary; the
+# reference for each is given in the comment.
+
+sweep:
+  pairs_per_seed: 2400      # sensitivity: 50 to 2000 tested
+  seeds: [73, 211, 977]     # three independent draws, pooled for the curves
+  bins: 24                  # normalized step grid resolution
+  layer: last               # the residual stream that feeds the unembedding
+  readout_position: last    # final token of the completion
+
+generation:
+  chain_temperature: 0.6    # chains are sampled from the model's distribution
+  chain_top_p: 0.95
+  answer_temperature: 0.0   # greedy, so the readout adds no noise of its own
+  max_chain_tokens: 512
+  max_answer_tokens: 32
+  precision: float16
+
+pairing:
+  # Base and source drawn independently within a component, keeping both
+  # same-answer and different-answer pairs. Restricting to different-answer
+  # pairs would condition the estimand on a redirection being possible.
+  independent_within_component: true
+  retain_same_answer_pairs: true
+  stratify_by_answer: true  # so no single answer class dominates
+
+inference:
+  bootstrap_resamples: 2000
+  permutations: 10000
+  alpha: 0.05
+  interval_level: 0.95
+  # Differences between models use a Bonferroni projection of the two marginal
+  # intervals, which is valid whatever the dependence between them is.
+  difference_interval: dependence_robust
+
+prescribed:
+  instances: 4000           # sample size for estimating the state-answer joint
