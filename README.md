@@ -1,18 +1,35 @@
-<div align="center">
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.1%2B-red.svg)](https://pytorch.org/)
+[![CUDA](https://img.shields.io/badge/CUDA-12.1-green.svg)](https://developer.nvidia.com/cuda-toolkit)
+[![Transformers](https://img.shields.io/badge/Transformers-4.40%2B-orange.svg)](https://huggingface.co/docs/transformers)
+[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Venue](https://img.shields.io/badge/ICLR-2027-purple.svg)](#)
 
-# Commitment Depth
+> **Ahead of the Evidence: Certifying Premature Commitment in Chains of Thought**
+>
+> *Anonymous submission to ICLR 2027*
 
-**When does a chain of thought stop computing and start reporting?**
+---
 
-A causal measure of *when* a language model fixes its answer, and a normative
-reference for when it was entitled to.
+## TL;DR
 
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
-[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-25%20passing-brightgreen)](tests/)
-[![Style](https://img.shields.io/badge/style-ruff-orange)](https://docs.astral.sh/ruff/)
-
-</div>
+**Reasoning-distilled models fix their answer inside the residual stream before
+the chain of thought has built the state that would justify it.** We define
+*Commitment Depth* `CD_M(k)`, the normalized step at which transplanting a
+counterfactual internal state flips the output, and prove a *faithfulness bound*:
+no executor reading only the chain's own state can commit earlier than the
+prescribed trajectory `CD_P(k)`, the Bayes accuracy of that state under a
+C-RASP<sup>CoT</sup> reference program. **Causal Lookahead Probing (CLP)** is the
+parameter-free estimator that measures this, immune to the non-linear
+representation dilemma because nothing is fitted. Across 5 state-tracking tasks
+and 9 checkpoints from 5 families, the two reasoning-distilled checkpoints cross
+the bound on all three formal tasks where it leaves room (`U` up to **0.641** on
+A₅/S₅, all 15 prespecified comparisons at adjusted *p* < .001), committing
+**2.43× earlier** than the matched parent at identical accuracy, while every
+non-distilled checkpoint stays within `U < 0.012`. On transformers compiled from
+the program itself the estimator recovers the prescribed trajectory in **96 of
+96** step bins, so the separation is a property of the models, not of the
+measurement.
 
 ---
 
@@ -27,34 +44,32 @@ fixes how far the answer is pinned down after each step, and no rule reading onl
 that state can do better. A model that settles earlier than the state licenses
 has committed prematurely, and the gap is measurable.
 
-## What this code does
+## What the measurement does
 
 ```
-                 base instance                      source instance
+                base instance                       source instance
                       │                                    │
                       ▼                                    ▼
-         ┌────────────────────────┐          ┌────────────────────────┐
-         │  run the model, cache  │          │  run the model, cache  │
-         │  nothing               │          │  h(L) at step k        │
-         └────────────┬───────────┘          └───────────┬────────────┘
-                      │                                  │
-                      │        transplant at step k      │
-                      │◄─────────────────────────────────┘
-                      ▼
-         ┌────────────────────────┐
-         │  finish the chain,     │      answer == source answer ?
-         │  read the answer       │  ──────────────────────────────►  flip
-         └────────────────────────┘
+        ┌─────────────────────────┐         ┌─────────────────────────┐
+        │  run the model          │         │  run the model, cache   │
+        │                         │         │  h(L) at step k         │
+        └────────────┬────────────┘         └────────────┬────────────┘
+                     │                                   │
+                     │        transplant at step k       │
+                     │◄──────────────────────────────────┘
+                     ▼
+        ┌─────────────────────────┐
+        │  finish the chain,      │       answer == source answer ?
+        │  read the answer        │  ──────────────────────────────►  flip
+        └─────────────────────────┘
 ```
 
-Repeat over many base-source pairs and many steps. The flip rate, rescaled so
-that guessing scores zero, is **Commitment Depth** `CD_M(k)`. Compare it against
-the **prescribed trajectory** `CD_P(k)`, the Bayes accuracy of the best rule that
-sees only the reference program's state. The largest positive gap is the
-**unfaithfulness functional** `U`; the step at which `CD_M` first reaches one
-half is the **commitment step** `k*`.
+Repeat over many base–source pairs and many steps. The flip rate, rescaled so
+that guessing scores zero, is `CD_M(k)`. Compare it against `CD_P(k)`. The
+largest positive gap is the unfaithfulness functional `U`; the step at which
+`CD_M` first reaches one half is the commitment step `k*`.
 
-Two properties make the measurement hard to argue with:
+Two properties make the reading hard to argue with:
 
 - **Nothing is fitted.** The whole last-layer residual stream is transplanted,
   with no learned alignment, so a positive reading cannot be an artifact of a
@@ -67,12 +82,11 @@ Two properties make the measurement hard to argue with:
 
 ```bash
 git clone <this-repo> && cd cdclp
-python -m pip install -e ".[dev]"          # core + tests
+python -m pip install -e ".[dev]"          # core + tests, NumPy only
 python -m pip install -e ".[dev,models]"   # add torch / transformers
 ```
 
-Everything except the model backend runs on NumPy alone. The 25 unit tests need
-no GPU and no network:
+The 25 unit tests need no GPU and no network:
 
 ```bash
 pytest -q
@@ -80,7 +94,7 @@ pytest -q
 
 ## Quickstart
 
-The pipeline works end to end without a model, using a stub that produces a
+The pipeline runs end to end without a model, using a stub that produces a
 tunable flip pattern. Nothing it outputs is a claim about any real model, but it
 exercises every shape, every centering, and every statistic:
 
@@ -157,7 +171,7 @@ makes the bound too strong; one that discards information makes it too weak.
 
 ### Why the interval for a difference is wider than you expect
 
-`CD_M` is estimated by resampling base-source pairs. For a single model, a
+`CD_M` is estimated by resampling base–source pairs. For a single model, a
 percentile bootstrap gives an interval directly. For the *difference* between two
 models, the correct interval depends on whether both were resampled on a common
 draw of pairs. If they were, a paired interval is available and it is narrower.
@@ -209,7 +223,7 @@ pairs is available as an ablation but changes the estimand: the flip rate become
 conditional on a redirection being possible, which is not the quantity the bound
 constrains.
 
-## Reproducing a full sweep
+## Running a full sweep
 
 ```bash
 for SEED in 73 211 977; do
@@ -234,11 +248,13 @@ trained, so a sweep is inference only.
 - **The prescribed trajectory depends on the instance distribution.** It is
   computed from the tasks this code generates. Changing lengths, depths, or the
   balance of answer classes changes `CD_P`, and therefore changes what counts as
-  premature. Two runs are comparable only if they share a distribution.
+  premature. Two runs are comparable only if they share a distribution, and the
+  crossings this code produces need not match those of another implementation of
+  the same task family.
 - **Timing, not location.** The whole residual stream is transplanted, so the
   measure says when the answer was fixed, not which variable carries it. Spatial
   localization needs a different tool, and a fitted one.
-- **Low accuracy is uninformative, in both directions.** When a model is near
+- **Low accuracy is uninformative in both directions.** When a model is near
   chance, the flip signal is dominated by guessing and the estimated `U` stays
   indistinguishable from zero. A null reading there is not evidence of
   faithfulness.
