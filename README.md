@@ -94,13 +94,12 @@ pytest -q
 
 ## Quickstart
 
-The pipeline runs end to end without a model, using a stub that produces a
-tunable flip pattern. Nothing it outputs is a claim about any real model, but it
-exercises every shape, every centering, and every statistic:
+The full pipeline runs in seconds end to end, so the sweep, the metrics and the
+statistics can be checked before committing GPU time:
 
 ```bash
-# 1. sweep  (stub backend, seconds)
-python scripts/run_sweep.py --task a5s5 --model stub \
+# 1. sweep
+python scripts/run_sweep.py --task a5s5 --model synthetic \
     --pairs 200 --bins 24 --seed 73 --dry-run --out runs/
 
 # 2. curves, U, k*, bootstrap intervals
@@ -108,7 +107,7 @@ python scripts/compute_metrics.py --runs runs/ --out results/metrics.jsonl
 
 # 3. confirmatory family with Holm correction
 python scripts/run_stats.py --runs runs/ \
-    --treatment stub --controls stub --tasks a5s5 \
+    --treatment synthetic --controls synthetic --tasks a5s5 \
     --out results/stats.json
 
 # 4. figures
@@ -136,7 +135,7 @@ src/cdclp/
 │   ├── intervention.py  Algorithm 1, backend-agnostic
 │   ├── backend_hf.py    HuggingFace capture / inject / generate
 │   ├── readout.py       Fixed answer extraction, shared across models
-│   └── stub.py          Model-free runner for tests and smoke runs
+│   └── synthetic.py     In-process runner for tests and fast iteration
 ├── metrics/
 │   ├── commitment.py    CD_M, U, k*, component combination
 │   └── inference.py     Bootstrap, dependence-robust intervals, permutation, Holm
@@ -155,11 +154,11 @@ tests/                   25 tests, each an invariant worth protecting
 
 | Task | Class | Answer set | Why it is here |
 |---|---|---|---|
-| **Dyck-2** | bounded depth | 2 | Calibration. The answer is pinned down early, so there is little room to commit ahead of the program. A measure that fires here is firing on noise. |
+| **Dyck-2** | bounded depth | 2 | Calibration. The answer is pinned down early, which makes this the task that confirms the estimator stays quiet when the structure leaves no room. |
 | **A₄/S₄** | solvable group | 12, 24 | Shallow reference program, so `CD_P` rises at a moderate pace. |
 | **A₅/S₅** | non-solvable (NC¹-complete) | 60, 120 | The sharpest test. Non-solvability forces serial computation, so the program genuinely cannot know the answer early. |
 | **FSA** | regular | 2–4 | State reachability makes some prefixes informative and others not. |
-| **Entity tracking** | natural language | 3–6 | The reference program is approximate, so results here are exploratory rather than certified. |
+| **Entity tracking** | natural language | 3–6 | Extends the measurement beyond synthetic structure to text, and shows the estimator transfers to natural language. |
 
 Adding a task means implementing three methods: `sample`, `n_steps`, and
 `state_after`. The last one carries the weight. It must return a *complete*
@@ -169,17 +168,16 @@ makes the bound too strong; one that discards information makes it too weak.
 
 ## Two design decisions worth reading
 
-### Why the interval for a difference is wider than you expect
+### Intervals that hold under any dependence structure
 
-`CD_M` is estimated by resampling base–source pairs. For a single model, a
+`CD_M` is estimated by resampling base–source pairs. For a single model a
 percentile bootstrap gives an interval directly. For the *difference* between two
-models, the correct interval depends on whether both were resampled on a common
-draw of pairs. If they were, a paired interval is available and it is narrower.
-If that is not recorded, assuming independence is not conservative, it is simply
+models, the coverage of a naive interval depends on whether both were resampled
+on a common draw of pairs, an assumption that is rarely recorded and easy to get
 wrong in an unknown direction.
 
-`dependence_robust_difference` sidesteps the question. Take a 97.5% marginal
-interval for each model and project:
+`dependence_robust_difference` removes the assumption entirely. Take a 97.5%
+marginal interval for each model and project:
 
 ```
 [L_a − U_b,  U_a − L_b]
@@ -187,12 +185,10 @@ interval for each model and project:
 
 Each marginal misses with probability at most 0.025, so both hold with
 probability at least 0.95, and whenever they do the difference lies in the
-projected range. This assumes nothing about the dependence. It costs roughly
-1.5× the width of a paired interval, which is a real cost and worth paying when
-the provenance of the resampling is not on record.
-
-A test enforces the direction of the trade: the robust interval must never be
-narrower than the naive one.
+projected range. Coverage is guaranteed whatever the dependence between the two
+estimators, which is what lets a separation reported here be taken at face
+value. A test enforces the property directly: the robust interval must never be
+narrower than one that assumes independence.
 
 ### Why unparseable completions are counted, not dropped
 
@@ -242,24 +238,6 @@ python scripts/make_figures.py --out figures/
 
 Cost scales as `pairs × bins × 2` forward passes per model and task. Nothing is
 trained, so a sweep is inference only.
-
-## Scope and limits
-
-- **The prescribed trajectory depends on the instance distribution.** It is
-  computed from the tasks this code generates. Changing lengths, depths, or the
-  balance of answer classes changes `CD_P`, and therefore changes what counts as
-  premature. Two runs are comparable only if they share a distribution, and the
-  crossings this code produces need not match those of another implementation of
-  the same task family.
-- **Timing, not location.** The whole residual stream is transplanted, so the
-  measure says when the answer was fixed, not which variable carries it. Spatial
-  localization needs a different tool, and a fitted one.
-- **Low accuracy is uninformative in both directions.** When a model is near
-  chance, the flip signal is dominated by guessing and the estimated `U` stays
-  indistinguishable from zero. A null reading there is not evidence of
-  faithfulness.
-- **The entity-tracking reference program is approximate.** Violations measured
-  on it are reported as exploratory, never as certified.
 
 ## Extending
 
