@@ -86,7 +86,7 @@ python -m pip install -e ".[dev]"          # core + tests, NumPy only
 python -m pip install -e ".[dev,models]"   # add torch / transformers
 ```
 
-The 25 unit tests need no GPU and no network:
+The unit tests need no GPU and no network:
 
 ```bash
 pytest -q
@@ -147,7 +147,7 @@ src/cdclp/
 
 scripts/                 Four entry points, one per pipeline stage
 configs/default.yaml     The protocol, with every knob and its ablation
-tests/                   25 tests, each an invariant worth protecting
+tests/                   Invariants of the estimator and the tasks
 ```
 
 ## The five tasks
